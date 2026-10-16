@@ -1,4 +1,3 @@
-import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
@@ -51,49 +50,12 @@ type GoalSnapshot = {
   sampledAt?: number
 }
 
-type GoalToolPart = {
-  type: string
-  tool?: string
-  state?: {
-    status?: string
-    output?: string
-  }
-  tokens?: unknown
-}
-
-type SessionMessage = {
-  id: string
-}
-
-type GoalSessionState = {
-  goal: GoalSnapshot | null
-  messageIndex: number
-}
 type ElementChild = string | number | boolean | null | undefined | object | (() => ElementChild)
-
-type ModernTuiApi = TuiPluginApi & {
-  keymap?: {
-    registerLayer?: (layer: {
-      commands: {
-        namespace: string
-        name: string
-        title: string
-        desc?: string
-        category?: string
-        run?: () => void
-      }[]
-      bindings?: unknown[]
-    }) => () => void
-  }
-}
-
-const goalCache = new Map<string, GoalSnapshot>()
 
 const GOAL_TOOL_NAMES: readonly string[] = [
   "get_goal",
   "get_goal_history",
   "create_goal",
-  "set_goal",
   "update_goal",
   "update_goal_objective",
   "update_goal_status",
@@ -172,177 +134,10 @@ function goalColorsV2(theme: unknown) {
   }
 }
 
-function goalSnapshotKey(sessionID: string) {
-  return `goal-mode.snapshot.${sessionID}`
-}
 
-function cachedGoal(api: TuiPluginApi, sessionID: string) {
-  const memory = goalCache.get(sessionID)
-  if (memory) return memory
-  const persisted = api.kv?.get(goalSnapshotKey(sessionID), null)
-  return isGoalSnapshot(persisted) ? persisted : null
-}
 
-function cacheGoal(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | null) {
-  if (goal) {
-    goalCache.set(sessionID, goal)
-    api.kv?.set(goalSnapshotKey(sessionID), goal)
-    return
-  }
-  goalCache.delete(sessionID)
-  api.kv?.set(goalSnapshotKey(sessionID), null)
-}
 
-function currentSessionID(api: TuiPluginApi) {
-  const route = api.route.current
-  if (route.name !== "session") return undefined
-  const sessionID = route.params?.sessionID
-  return typeof sessionID === "string" ? sessionID : undefined
-}
 
-function toast(
-  api: TuiPluginApi,
-  messages: GoalMessages,
-  message: string,
-  variant: "info" | "success" | "warning" | "error" = "info",
-) {
-  api.ui.toast({ title: messages.tui.title, message, variant, duration: 2500 })
-}
-
-async function sendGoalPrompt(api: TuiPluginApi, sessionID: string, text: string) {
-  await api.client.session.promptAsync({
-    sessionID,
-    parts: [{ type: "text", text }],
-  })
-}
-
-function refreshGoalPrompt(messages: GoalMessages) {
-  return messages.tui.refreshPrompt
-}
-
-function clearGoalPrompt(messages: GoalMessages) {
-  return messages.tui.clearPrompt
-}
-
-function pauseGoalPrompt(messages: GoalMessages) {
-  return messages.tui.pausePrompt
-}
-
-function resumeGoalPrompt(messages: GoalMessages) {
-  return messages.tui.resumePrompt
-}
-
-function historyGoalPrompt(messages: GoalMessages) {
-  return messages.tui.historyPrompt
-}
-
-function actionOption(
-  api: TuiPluginApi,
-  messages: GoalMessages,
-  sessionID: string,
-  title: string,
-  value: string,
-  description: string,
-  prompt: string,
-) {
-  return {
-    title,
-    value,
-    description,
-    onSelect: () => {
-      void sendGoalPrompt(api, sessionID, prompt)
-        .then(() => api.ui.dialog.clear())
-        .catch((error) => toast(api, messages, error instanceof Error ? error.message : String(error), "error"))
-    },
-  }
-}
-
-function showSummary(
-  api: TuiPluginApi,
-  messages: GoalMessages,
-  locale: ReturnType<typeof resolveLocale>,
-  sessionID: string,
-  goal: GoalSnapshot | null,
-) {
-  const DialogSelect = api.ui.DialogSelect
-  const options = [
-    actionOption(
-      api,
-      messages,
-      sessionID,
-      messages.tui.refresh,
-      "refresh",
-      messages.tui.refreshDescription,
-      refreshGoalPrompt(messages),
-    ),
-    ...(goal
-      ? [
-          actionOption(
-            api,
-            messages,
-            sessionID,
-            messages.tui.history,
-            "history",
-            messages.tui.historyDescription,
-            historyGoalPrompt(messages),
-          ),
-          ...(goal.status === "active"
-            ? [
-                actionOption(
-                  api,
-                  messages,
-                  sessionID,
-                  messages.tui.pause,
-                  "pause",
-                  messages.tui.pauseDescription,
-                  pauseGoalPrompt(messages),
-                ),
-              ]
-            : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
-            ? [
-                actionOption(
-                  api,
-                  messages,
-                  sessionID,
-                  messages.tui.resume,
-                  "resume",
-                  messages.tui.resumeDescription,
-                  resumeGoalPrompt(messages),
-                ),
-              ]
-            : []),
-          actionOption(
-            api,
-            messages,
-            sessionID,
-            messages.tui.clear,
-            "clear",
-            messages.tui.clearDescription,
-            clearGoalPrompt(messages),
-          ),
-        ]
-      : []),
-  ]
-
-  api.ui.dialog.setSize("large")
-  api.ui.dialog.replace(() =>
-    DialogSelect({
-      title: messages.tui.title,
-      placeholder: formatGoal(goal, messages, locale),
-      options,
-      onSelect(option) {
-        option.onSelect?.()
-      },
-    }),
-  )
-}
-
-function sessionIDOrToast(api: TuiPluginApi, messages: GoalMessages) {
-  const sessionID = currentSessionID(api)
-  if (!sessionID) toast(api, messages, messages.tui.openSession, "warning")
-  return sessionID
-}
 
 export function formatDuration(seconds: number) {
   const total = Math.max(0, Math.floor(seconds))
@@ -475,43 +270,6 @@ function usePersistedGoal(sessionID: string) {
   return persisted
 }
 
-function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
-  if (part.type !== "tool") return undefined
-  if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
-  if (part.state?.status !== "completed") return undefined
-  if (part.tool === "clear_goal") return null
-  if (typeof part.state.output !== "string") return undefined
-
-  try {
-    const parsed: unknown = JSON.parse(part.state.output)
-    if (!isRecord(parsed)) return undefined
-    if (parsed.goal === null) return null
-    return isGoalSnapshot(parsed.goal) ? parsed.goal : undefined
-  } catch {
-    return undefined
-  }
-}
-
-export function goalStateFromSession(api: TuiPluginApi, sessionID: string): GoalSessionState {
-  const messages = [...api.state.session.messages(sessionID)] as SessionMessage[]
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex]
-    if (!message) continue
-    const parts = [...api.state.part(message.id)].reverse() as GoalToolPart[]
-    for (const part of parts) {
-      const goal = parseGoalToolOutput(part)
-      if (goal !== undefined) {
-        cacheGoal(api, sessionID, goal)
-        return { goal, messageIndex }
-      }
-    }
-  }
-  return { goal: cachedGoal(api, sessionID), messageIndex: -1 }
-}
-
-function goalFromSession(api: TuiPluginApi, sessionID: string) {
-  return goalStateFromSession(api, sessionID).goal
-}
 
 export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
   if (!goal) return messages.tui.noGoal
@@ -531,101 +289,6 @@ export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, lo
   if (goal.completionEvidence) lines.push(`${messages.tui.completionEvidence}: ${goal.completionEvidence}`)
   if (goal.blocker) lines.push(`${messages.tui.blocker}: ${presentGoalLastStatus(goal.blocker, locale)}`)
   return lines.join("\n")
-}
-
-function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>, sessionID: string) {
-  const theme = api.theme.current
-  const state = goalStateFromSession(api, sessionID)
-  if (!state.goal) return null
-  const persisted = usePersistedGoal(sessionID)
-  const goal = createMemo(() => {
-    const live = persisted()
-    if (live === undefined) return state.goal
-    if (live && state.goal && (state.goal.createdAt > live.createdAt || state.goal.updatedAt > live.updatedAt)) return state.goal
-    return live
-  })
-  const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
-  const active = createMemo(() => goal()?.status === "active")
-  createEffect(() => {
-    if (!active()) return
-    const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
-    onCleanup(() => clearInterval(timer))
-  })
-  return box({}, [() => {
-    const snapshot = goal()
-    if (!snapshot) return null
-    if (snapshot.status === "complete" || snapshot.status === "unmet") {
-      const elapsed = liveTimeUsedSeconds(snapshot)
-      return text({ fg: snapshot.status === "complete" ? theme.primary : theme.textMuted }, [
-        `${snapshot.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
-      ])
-    }
-    return box({}, [
-      text({ fg: theme.text }, [messages.tui.title]),
-      text({ fg: theme.textMuted }, [`${messages.tui.status}: ${presentGoalStatus(snapshot.status, locale)}`]),
-      text({ fg: theme.textMuted }, [`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
-      text({ fg: theme.textMuted }, [
-        `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
-      ]),
-      text({ fg: theme.textMuted }, [
-        `${messages.tui.autoContinues}: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`,
-      ]),
-      ...(snapshot.lastCheckpoint
-        ? [text({ fg: theme.textMuted }, [`${messages.tui.checkpoint}: ${snapshot.lastCheckpoint.summary}`])]
-        : []),
-      ...(snapshot.stopReason
-        ? [text({ fg: theme.textMuted }, [`${messages.tui.stop}: ${presentGoalStopReason(snapshot.stopReason, locale)}`])]
-        : []),
-      ...(snapshot.lastStatus ? [text({ fg: theme.textMuted }, [presentGoalLastStatus(snapshot.lastStatus, locale)])] : []),
-      text({ fg: theme.textMuted }, [snapshot.objective]),
-    ])
-  }])
-}
-
-function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
-  const modern = api as ModernTuiApi
-  if (modern.keymap?.registerLayer) {
-    modern.keymap.registerLayer({
-      commands: [
-        {
-          namespace: "palette",
-          name: command.value,
-          title: command.title,
-          desc: command.description,
-          category: command.category,
-          run: command.onSelect,
-        },
-      ],
-      bindings: [],
-    })
-    return
-  }
-  api.command?.register(() => [command])
-}
-
-const tui: TuiPlugin = async (api, options) => {
-  const locale = resolveLocale(typeof options?.locale === "string" ? options.locale : undefined)
-  const messages = messagesFor(locale)
-  api.slots.register({
-    order: 125,
-    slots: {
-      sidebar_content(_ctx, props) {
-        return GoalSidebar(api, messages, locale, props.session_id)
-      },
-    },
-  })
-
-  registerGoalCommand(api, {
-    title: messages.tui.title,
-    value: "goal.show",
-    category: messages.tui.title,
-    description: messages.tui.commandDescription,
-    onSelect: () => {
-      const sessionID = sessionIDOrToast(api, messages)
-      if (!sessionID) return
-      showSummary(api, messages, locale, sessionID, goalFromSession(api, sessionID))
-    },
-  })
 }
 
 // --- V2 TUI plugin ---
@@ -706,15 +369,12 @@ async function showSummaryV2(
     placeholder: formatGoal(goal, messages, locale),
     options,
   })
-  const prompt = selected === "refresh" ? refreshGoalPrompt(messages)
-    : selected === "history" ? historyGoalPrompt(messages)
-    : selected === "pause" ? pauseGoalPrompt(messages)
-    : selected === "resume" ? resumeGoalPrompt(messages)
-    : selected === "clear" ? clearGoalPrompt(messages)
-    : undefined
-  if (!prompt) return
+  if (typeof selected !== "string" || !options.some((option) => option.value === selected)) return
   try {
-    await api.client.session.prompt({ sessionID, text: prompt })
+    const name = typeof api.options?.command_name === "string" ? api.options.command_name : "goal"
+    // The pinned V2 SDK calls this field command; current V2 hosts call it name.
+    const input = { sessionID, command: name, name, text: selected === "refresh" ? "status" : selected }
+    await api.client.session.command(input)
   } catch (error) {
     toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
   }
@@ -805,13 +465,16 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, loc
         description: messages.tui.commandDescription,
         group: messages.tui.title,
         palette: true,
-        run: () => {
+        run: async () => {
           const sessionID = currentSessionIDV2(api)
           if (!sessionID) {
             toastV2(api, messages, messages.tui.openSession, "warning")
             return
           }
-          const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
+          const persisted = await readPersistedGoal(sessionID)
+          const goal = persisted === undefined
+            ? goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
+            : persisted
           void showSummaryV2(api, messages, locale, sessionID, goal)
         },
       },
@@ -841,9 +504,8 @@ export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
   }
 }
 
-const plugin: TuiPluginModule & TuiPluginV2.Definition = {
+const plugin: TuiPluginV2.Definition = {
   id: "local.goal-mode.tui",
-  tui,
   setup: setupTuiV2,
 }
 

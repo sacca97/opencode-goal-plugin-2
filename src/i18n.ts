@@ -154,11 +154,11 @@ const EN_MESSAGES: GoalMessages = {
       "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, " +
       "remaining work, and blockers, then wait for the user to resume or edit the goal.",
     duplicateGoal:
-      "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and " +
+      "This non-closed goal already exists. Do not call create_goal again. The existing objective and " +
       "limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only " +
       "when its status permits execution.",
     conflictingGoal:
-      "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict " +
+      "A different non-closed goal already exists. Do not call create_goal again. Report the conflict " +
       "instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested.",
     restrictedGoal:
       "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. " +
@@ -263,9 +263,9 @@ const ZH_CN_MESSAGES: GoalMessages = {
     limitedGoal:
       "已达到安全限制。不要开始或继续此目标的实质性工作。请总结已有进展、剩余工作和阻塞项，然后等待用户继续或编辑目标。",
     duplicateGoal:
-      "这个未关闭目标已经存在。不要再次调用 create_goal 或 set_goal。现有目标内容和限制已保留，重复调用的参数没有应用。请使用返回的目标状态，并且只在其状态允许执行时继续。",
+      "这个未关闭目标已经存在。不要再次调用 create_goal。现有目标内容和限制已保留，重复调用的参数没有应用。请使用返回的目标状态，并且只在其状态允许执行时继续。",
     conflictingGoal:
-      "已有另一个未关闭目标。不要再次调用 create_goal 或 set_goal，也不要替换现有目标；请报告冲突。只有在用户明确要求时，才可编辑、清除、完成目标或将其标记为 unmet。",
+      "已有另一个未关闭目标。不要再次调用 create_goal，也不要替换现有目标；请报告冲突。只有在用户明确要求时，才可编辑、清除、完成目标或将其标记为 unmet。",
     restrictedGoal:
       "当前受限 Agent 或 Plan 模式暂停状态不允许执行目标。请先切换到 Build 模式并继续目标，再进行实质性工作。",
     cannotResumeInPlan: "会话处于 Plan 模式时不能继续目标；请让用户切换到 Build 模式后再继续该目标",

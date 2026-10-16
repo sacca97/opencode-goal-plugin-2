@@ -136,7 +136,7 @@ type MockContext = {
   renderer: unknown
   client: {
     session: {
-      prompt: (input: { sessionID: string; text: string }) => Promise<unknown>
+      command: (input: { sessionID: string; text: string; name: string; command: string }) => Promise<unknown>
     }
   }
   data: {
@@ -185,7 +185,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   slots: Map<string, (props: { sessionID: string }) => unknown>
   disposed: string[]
   layers: Array<() => MockKeymapLayer>
-  promptCalls: Array<{ sessionID: string; text: string }>
+  promptCalls: Array<{ sessionID: string; text: string; name: string; command: string }>
   toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }>
   selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }>
   setMessages: (messages: SessionMessageInfo[]) => void
@@ -194,7 +194,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   const slots = new Map<string, (props: { sessionID: string }) => unknown>()
   const disposed: string[] = []
   const layers: Array<() => MockKeymapLayer> = []
-  const promptCalls: Array<{ sessionID: string; text: string }> = []
+  const promptCalls: Array<{ sessionID: string; text: string; name: string; command: string }> = []
   const toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }> = []
   const selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }> = []
   const [messages, setMessages] = createSignal<SessionMessageInfo[]>([])
@@ -209,7 +209,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
     renderer: undefined,
     client: {
       session: {
-        async prompt(input) {
+        async command(input) {
           promptCalls.push(input)
           return { id: "pending_1" }
         },
@@ -314,7 +314,7 @@ async function waitFor(predicate: () => boolean) {
 test("V2 TUI definition exposes id and a setup function", () => {
   expect(plugin.id).toBe("local.goal-mode.tui")
   expect(typeof plugin.setup).toBe("function")
-  expect(typeof plugin.tui).toBe("function")
+  expect("tui" in plugin).toBe(false)
 })
 
 test("registerSlotV2 uses the options argument when the host takes one parameter", () => {
@@ -670,7 +670,7 @@ test("V2 keymap layer registers the goal palette command when the app slot rende
   }
 })
 
-test("V2 palette command prompts the agent through client.session.prompt after dialog.select", async () => {
+test("V2 palette command invokes the native goal command after dialog.select", async () => {
   const { mock, slots, layers, setMessages, setRoute, selectCalls, promptCalls, toasts } = makeMockContext()
   mock.ui.dialog.select = async (options) => {
     selectCalls.push(options)
@@ -704,7 +704,9 @@ test("V2 palette command prompts the agent through client.session.prompt after d
     await waitFor(() => promptCalls.length === 1)
     expect(promptCalls[0]).toEqual({
       sessionID: "ses_v2",
-      text: expect.stringContaining('update_goal_status with status "active"'),
+      text: "resume",
+      name: "goal",
+      command: "goal",
     })
     expect(toasts).toEqual([])
 

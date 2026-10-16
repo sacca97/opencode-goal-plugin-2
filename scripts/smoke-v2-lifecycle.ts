@@ -10,10 +10,12 @@ const root = await mkdtemp(join(tmpdir(), "goal-v2-lifecycle-smoke-"))
 const project = join(root, "project")
 await mkdir(project)
 const target = process.argv[2] ?? "."
-const registryPackage = target.startsWith("@")
-const packagePath = registryPackage ? target : resolve(target)
+const packagePath = resolve(target)
 let modelCalls = 0
 let continuationCalls = 0
+let backgroundIssued = false
+let backgroundReturnedAt: number | undefined
+let continuedBeforeShellExit = false
 const model = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
@@ -30,17 +32,27 @@ const model = Bun.serve({
     const continuationCount = messages.filter((message) => message.role === "user" &&
       JSON.stringify(message.content).includes("Continue working toward the active session goal")).length
     const hasContinuation = continuationCount > 0
+    const backgroundSession = JSON.stringify(messages).includes("goal_fixture_background")
+    if (backgroundIssued && backgroundSession && !backgroundReturnedAt && last?.role === "tool") backgroundReturnedAt = Date.now()
+    if (hasContinuation && backgroundSession && backgroundReturnedAt && Date.now() - backgroundReturnedAt < 2500) continuedBeforeShellExit = true
     if (hasContinuation) continuationCalls++
     const toolName = hasContinuation ? "update_goal" : "create_goal"
     const tool = body.tools?.find((entry) => entry.function.name === toolName || entry.function.name.endsWith(`_${toolName}`))
-    const call = last?.role === "user" && tool && (!hasContinuation || continuationCount >= 2)
+    const controlOnly = JSON.stringify(last?.content).includes("Goal control has already been applied")
+    const steering = JSON.stringify(last?.content).includes("STEER_FIXTURE")
+    const call = !controlOnly && !steering && last?.role === "user" && tool && (!hasContinuation || continuationCount >= 2)
     const args = hasContinuation
       ? { status: "complete", evidence: "A native V2 execution settled and the plugin automatically sent the next goal prompt." }
       : { objective: "Verify native V2 goal continuation with the local fixture model", max_auto_turns: 3 }
-    const delta = call
+    const shell = body.tools?.find((entry) => entry.function.name === "shell")
+    const launchBackground = process.env.GOAL_BACKGROUND_SHELL === "1" && !backgroundIssued && !hasContinuation && last?.role === "tool" && shell
+    if (launchBackground) backgroundIssued = true
+    const delta = launchBackground
+      ? { role: "assistant", tool_calls: [{ index: 0, id: `call_${modelCalls}`, type: "function", function: { name: shell.function.name, arguments: JSON.stringify({ command: "sleep 3 # goal_fixture_background", background: true }) } }] }
+      : call
       ? { role: "assistant", tool_calls: [{ index: 0, id: `call_${modelCalls}`, type: "function", function: { name: tool.function.name, arguments: JSON.stringify(args) } }] }
       : { role: "assistant", content: `Isolated fixture milestone ${modelCalls} is verified. The active goal still requires the next automatic continuation turn.` }
-    const finish = call ? "tool_calls" : "stop"
+    const finish = call || launchBackground ? "tool_calls" : "stop"
     const chunk = (choices: unknown[], usage?: unknown) => ({ id: `chatcmpl_${modelCalls}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "fixture", choices, ...(usage ? { usage } : {}) })
     const usage = { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 }
     if (!body.stream) {
@@ -56,17 +68,14 @@ const model = Bun.serve({
 })
 
 await mkdir(join(root, "config/opencode"), { recursive: true })
-if (!registryPackage) {
-  await mkdir(join(root, "config/opencode/plugins"))
-  await writeFile(join(root, "config/opencode/plugins/goal.ts"), `export { default } from ${JSON.stringify(pathToFileURL(join(packagePath, "dist/server.js")).href)}\n`)
-}
 await writeFile(join(root, "config/opencode/opencode.json"), JSON.stringify({
   model: "fixture/fixture",
   snapshots: false,
+  plugins: [pathToFileURL(packagePath).href],
   providers: {
     fixture: {
       env: ["FIXTURE_API_KEY"],
-      package: "@opencode-ai/ai/providers/openai-compatible",
+      package: "@opencode/ai/providers/openai-compatible",
       settings: { baseURL: `http://127.0.0.1:${model.port}/v1` },
       models: { fixture: { name: "Local fixture", limit: { context: 100000, output: 1000 } } },
     },
@@ -88,18 +97,12 @@ const env = {
   FIXTURE_API_KEY: "local-fixture-only",
 }
 const binary = process.env.OPENCODE_V2_BIN ?? "opencode2"
-if (registryPackage) {
-  const install = Bun.spawn([binary, "plugin", "add", packagePath], { cwd: project, env, stdout: "pipe", stderr: "pipe" })
-  const [stdout, stderr, code] = await Promise.all([new Response(install.stdout).text(), new Response(install.stderr).text(), install.exited])
-  await writeFile(join(root, "install.log"), stdout + stderr)
-  if (code !== 0) {
-    model.stop(true)
-    throw new Error(`Plugin installation failed; inspect ${root}/install.log`)
-  }
-}
 const child = Bun.spawn([binary, "serve", "--hostname", "127.0.0.1", "--port", "0"], {
   cwd: project, env, stdout: "pipe", stderr: "pipe",
 })
+let secondChild: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">> | undefined
+let secondOutput = ""
+let secondReaders: Promise<void[]> | undefined
 let output = ""
 const consume = async (stream: ReadableStream<Uint8Array>) => {
   for await (const chunk of stream) output += new TextDecoder().decode(chunk)
@@ -122,8 +125,9 @@ let passed = false
 try {
   await waitFor("server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(output))
   const base = output.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
-  const api = async (path: string, data?: unknown) => {
-    const response = await fetch(`${base}${path}`, {
+  const api = async (path: string, data?: unknown, server = base) => {
+    const response = await fetch(`${server}${path}`, {
+      signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       method: data === undefined ? "GET" : "POST",
       headers: { "content-type": "application/json", authorization: `Basic ${btoa(`opencode:${env.OPENCODE_PASSWORD}`)}` },
       ...(data === undefined ? {} : { body: JSON.stringify(data) }),
@@ -138,17 +142,42 @@ try {
   // instance must not duplicate continuation delivery for the first location.
   const otherProject = join(root, "other-project")
   await mkdir(otherProject)
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(otherProject)}`, {})
-  await api(`/api/plugin/await-activation?location%5Bdirectory%5D=${encodeURIComponent(project)}`, {})
-  const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ id?: string; state?: { status: string; error?: string } }> }
-  await writeFile(join(root, "plugins.json"), JSON.stringify(plugins))
+  await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(otherProject)}`)
+  await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`)
+  await waitFor("plugin-active", async () => {
+    const plugins = await api(`/api/plugin?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ id?: string; state?: { status: string; error?: string } }> }
+    await writeFile(join(root, "plugins.json"), JSON.stringify(plugins))
+    return plugins.data.some((plugin) => plugin.id?.includes("goal") && plugin.state?.status === "active")
+  })
   await writeFile(join(root, "config.json"), JSON.stringify(await api(`/api/config?location%5Bdirectory%5D=${encodeURIComponent(project)}`)))
-  assert(plugins.data.some((plugin) => plugin.id === "local.goal-mode.server" && plugin.state?.status === "active"), `Goal plugin did not activate; inspect ${root}/plugins.json`)
   const commands = await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`) as { data: Array<{ name: string }> }
   assert(commands.data.some((command) => command.name === "goal"))
+  let secondGoal: Promise<unknown> | undefined
+  let secondSessionID: string | undefined
+  if (process.env.GOAL_TWO_SERVERS === "1") {
+    // Let the first host finish database migrations before opening it again.
+    secondChild = Bun.spawn([binary, "serve", "--hostname", "127.0.0.1", "--port", "0"], {
+      cwd: project, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    })
+    secondReaders = Promise.all([secondChild.stdout, secondChild.stderr].map(async (stream) => {
+      for await (const chunk of stream) secondOutput += new TextDecoder().decode(chunk)
+    }))
+    await waitFor("second-server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(secondOutput))
+    const secondBase = secondOutput.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
+    await api(`/api/command?location%5Bdirectory%5D=${encodeURIComponent(project)}`, undefined, secondBase)
+    const secondSession = await api("/api/session", { location: { directory: project }, title: "Concurrent second server", model: { providerID: "fixture", id: "fixture" }, agent: "build" }, secondBase)
+    secondSessionID = secondSession.data.id
+    secondGoal = api(`/api/session/${secondSessionID}/command`, { name: "goal", text: "Create a goal for the fixture milestone." }, secondBase)
+  }
   await api(`/api/session/${sessionID}/command`, {
-    command: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
+    name: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
   })
+  await secondGoal
+  if (secondSessionID) {
+    const shared = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8"))
+    assert.equal(shared.goals[secondSessionID].status, "complete")
+    assert.equal(shared.goals[secondSessionID].autoTurns, 2)
+  }
   let state: { goals: Record<string, { status: string; autoTurns: number }> } | undefined
   // Last-observed values for each final condition, so a timeout can report
   // which one was stuck instead of failing opaquely.
@@ -182,14 +211,18 @@ try {
   })
   assert.equal(state!.goals[sessionID]!.autoTurns, 2)
   assert(continuationCalls > 0)
+  if (process.env.GOAL_BACKGROUND_SHELL === "1") {
+    assert(backgroundIssued && backgroundReturnedAt, "Background shell fixture must execute")
+    assert(!continuedBeforeShellExit, "Goal continuation arrived before the background shell completed")
+  }
   const arraysSession = await api("/api/session", {
     location: { directory: project },
     title: "Isolated command arrays smoke",
     model: { providerID: "fixture", id: "fixture" },
     agent: "build",
   }) as { data: { id: string } }
-  await api(`/api/session/${arraysSession.data.id}/command`, {
-    command: "goal",
+  const arraysCommand = api(`/api/session/${arraysSession.data.id}/command`, {
+    name: "goal",
     text: "Create a goal for the arrays-present command smoke.",
     files: [],
     agents: [],
@@ -199,10 +232,34 @@ try {
     try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
     return state?.goals[arraysSession.data.id] != null
   })
+  await api(`/api/session/${arraysSession.data.id}/command`, { name: "pause_goal", text: "" })
+  await waitFor("direct-pause", async () => {
+    state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8"))
+    return state?.goals[arraysSession.data.id]?.status === "paused"
+  })
+  await arraysCommand
+  await api(`/api/session/${arraysSession.data.id}/command`, { name: "goal", text: "status" })
+  assert.equal(JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")).goals[arraysSession.data.id].status, "paused")
+  const resumed = api(`/api/session/${arraysSession.data.id}/command`, { name: "resume_goal", text: "" })
+  await waitFor("resumed-active", async () => {
+    state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8"))
+    return state?.goals[arraysSession.data.id]?.status === "active"
+  })
+  await api(`/api/session/${arraysSession.data.id}/prompt`, {
+    text: "STEER_FIXTURE: use the latest findings to adjust the next step, keeping the same goal.", delivery: "steer",
+  })
+  assert.notEqual(JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")).goals[arraysSession.data.id].status, "paused")
+  await resumed
+  await waitFor("direct-resume-complete", async () => {
+    state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8"))
+    return state?.goals[arraysSession.data.id]?.status === "complete"
+  })
   const summary = {
     result: "PASS",
     packagePath,
     sessionID,
+    servers: secondChild ? 2 : 1,
+    secondSessionID,
     modelCalls,
     continuationCalls,
     status: state!.goals[sessionID]!.status,
@@ -212,6 +269,10 @@ try {
   console.log(JSON.stringify(summary, null, 2))
   passed = true
 } finally {
+  secondChild?.kill()
+  if (secondChild) await secondChild.exited
+  await secondReaders
+  if (secondChild) await writeFile(join(root, "second-server.log"), secondOutput)
   child.kill()
   await child.exited
   await readers

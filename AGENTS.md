@@ -2,15 +2,18 @@
 
 ## Project Shape
 
-This package is an OpenCode plugin with separate server and TUI entrypoints:
+This fork targets OpenCode 2.x with separate server and TUI entrypoints:
 
-- `src/server.ts` is the server plugin. It registers the `/goal` command, goal tools, chat/session hooks, usage accounting, compaction context, and idle auto-continuation.
+- `src/server.ts` is the V2 server plugin. It registers goal commands, tools, session hooks, usage accounting, compaction context, and execution continuation. `server.js` exposes the build to the V2 local-directory loader.
 - `src/state.ts` owns goal persistence and lifecycle state. It stores JSON at `OPENCODE_GOAL_STATE_PATH` when set, otherwise under the user's OpenCode data location.
-- `src/tui.ts` is the Solid/OpenTUI sidebar and command-palette UI. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason. OpenTUI/solid are peer dependencies resolved from the host at runtime.
+- `src/tui.ts` is the V2 Solid/OpenTUI sidebar and palette. `tui.ts` exposes it to the local-directory loader. OpenTUI/Solid remain peer dependencies resolved from the host.
 - `src/prompts.ts` contains the goal-mode continuation/system/compaction prompts.
 - `test/` covers state, server hooks/tools, and TUI behavior with Bun tests.
 
 ## Change Guidelines
+
+- The server runs on Bun only: `src/state-lock.ts` uses `bun:sqlite` for the cross-process state lock, and the build targets Bun. It leaves a `<state>.lock.sqlite` file next to the state file; that is expected.
+- `dist/` is gitignored and untracked. Run `bun run build` before loading the checkout through the root `server.js`.
 
 - Preserve the public Promise-based state API (`getGoal`, `createGoal`, `completeGoal`, etc.) because OpenCode hooks and tests call it directly.
 - Keep `zod` for OpenCode tool argument schemas unless the OpenCode plugin API explicitly supports another schema format.
@@ -31,7 +34,7 @@ bun run build
 bun run pack:dry-run
 ```
 
-`bun run build` writes `dist/server.js`. The package only publishes `dist`, `src/tui.tsx`, `LICENSE`, and `README.md`, so confirm `npm pack --dry-run` includes what runtime installation needs.
+`bun run build` writes `dist/server.js`. Confirm `npm pack --dry-run` includes the runtime entrypoints and shared TUI modules listed in package.json.
 
 ## Publishing Flow
 
@@ -48,10 +51,10 @@ gh release view v<version>
 
 To test this plugin end to end, do not stop at unit tests. Run the local gates first: `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`, and `bun run pack:dry-run`.
 
-After publishing, verify the exact npm version with `npm view @prevalentware/opencode-goal-plugin version dependencies`. Install that version in an isolated temp OpenCode project with `opencode plugin @prevalentware/opencode-goal-plugin@<version>`, run `opencode debug config` to confirm the package is loaded and the `goal` command is registered, then run a smoke test with an isolated state file, for example:
+For this local fork, run the deterministic smoke test directly from the checkout. It starts a private V2 server with an isolated home, configuration, database, and state file, and loads the local build without installing the plugin:
 
 ```bash
-OPENCODE_GOAL_STATE_PATH="/tmp/opencode-goal-plugin-smoke/goals.json" opencode run "/goal create a smoke-test goal and then report the current goal state"
+OPENCODE_V2_BIN=/path/to/opencode bun run smoke:v2
 ```
 
-The smoke test should show `create_goal` and `get_goal` tool calls and report an active goal. Inspect the state file afterward if you need to confirm JSON persistence.
+The smoke test must deliver exactly two automatic continuations and complete the goal. It prints the temporary artifact directory for inspection. Do not install, publish, or modify the user's OpenCode configuration unless requested.

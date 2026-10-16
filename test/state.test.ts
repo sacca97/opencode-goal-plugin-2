@@ -21,6 +21,7 @@ import {
   pauseGoalForPlanMode,
   recordContinuationResult,
   recordPromptAgent,
+  recordGoalRuntimeFailure,
   recordToolProgress,
   reserveContinuation,
   replaceGoal,
@@ -41,6 +42,29 @@ beforeEach(async () => {
 afterEach(async () => {
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
+})
+
+test("absent goals and unchanged mutations do not replace the state file", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await accountUsage("ses_absent", 100)
+  expect(await Bun.file(file).exists()).toBe(false)
+  await createGoal("ses_1", "preserve state")
+  const before = await stat(file)
+  await accountUsage("ses_absent", 200)
+  await cancelActiveGoal("ses_absent")
+  const after = await stat(file)
+  expect(after.ino).toBe(before.ino)
+  expect(after.mtimeMs).toBe(before.mtimeMs)
+})
+
+test("delayed runtime failures preserve replacements and explicit pauses", async () => {
+  const original = await createGoal("ses_1", "original")
+  const replacement = (await replaceGoal("ses_1", "replacement")).goal
+  expect(await recordGoalRuntimeFailure("ses_1", original.id, "stale outage", true)).toBeNull()
+  expect((await getGoal("ses_1"))?.status).toBe("active")
+  await setGoalStatus("ses_1", "paused")
+  expect(await recordGoalRuntimeFailure("ses_1", replacement.id, "late outage", true)).toBeNull()
+  expect(await getGoal("ses_1")).toMatchObject({ status: "paused", stopReason: "paused", lastStatus: "Goal paused." })
 })
 
 test("creates, reads, pauses, resumes, completes, and clears a goal", async () => {
@@ -463,6 +487,7 @@ test("direct usage accounting remains the default and does not establish a track
 test("reserves continuation until max auto turns is reached", async () => {
   await createGoal("ses_1", "continue", null)
   expect(await reserveContinuation("ses_1", 1, 0)).not.toBeNull()
+  await recordToolProgress("ses_1", "Turn completed")
   const limited = await reserveContinuation("ses_1", 1, 0)
   expect(limited?.status).toBe("usageLimited")
   expect(limited?.budgetWrapupSent).toBe(true)
@@ -473,7 +498,9 @@ test("reserves continuation until max auto turns is reached", async () => {
 test("resuming after the auto-turn limit starts a fresh continuation window", async () => {
   await createGoal("ses_1", "continue", { maxAutoTurns: 2 })
   expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(1)
+  await recordAssistantProgress("ses_1", { messageID: "window1", text: "First turn completed", evaluateContinuation: true })
   expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(2)
+  await recordToolProgress("ses_1", "Turn completed")
   expect((await reserveContinuation("ses_1", 25, 0))?.status).toBe("usageLimited")
 
   const resumed = await setGoalStatus("ses_1", "active", null, { resetAutoTurnLimit: true })
@@ -485,13 +512,16 @@ test("resuming after the auto-turn limit starts a fresh continuation window", as
   })
 
   expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(1)
+  await recordAssistantProgress("ses_1", { messageID: "window2", text: "Next turn completed", evaluateContinuation: true })
   expect((await reserveContinuation("ses_1", 25, 0))?.autoTurns).toBe(2)
+  await recordToolProgress("ses_1", "Turn completed")
   expect((await reserveContinuation("ses_1", 25, 0))?.status).toBe("usageLimited")
 })
 
 test("a generic status update cannot renew the auto-turn limit", async () => {
   await createGoal("ses_1", "continue", { maxAutoTurns: 1 })
   await reserveContinuation("ses_1", 25, 0)
+  await recordToolProgress("ses_1", "Turn completed")
   await reserveContinuation("ses_1", 25, 0)
 
   const resumed = await setGoalStatus("ses_1", "active")
@@ -944,6 +974,7 @@ test("recordToolProgress only clears the pending attempt captured for the same t
 
   // A newer attempt supersedes the one the (still-running) tool call started
   // under; the delayed output must not clear it.
+  await recordContinuationResult("ses_1", "failure", 5)
   await reserveContinuation("ses_1", 10, 0)
   await recordContinuationResult("ses_1", "success", 5)
   const attemptB = (await getGoalInternal("ses_1"))?.pendingAttempt?.id

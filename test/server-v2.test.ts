@@ -12,7 +12,6 @@ const TOOL_NAMES = [
   "get_goal_history",
   "list_all_goals",
   "replace_goal",
-  "set_goal",
   "stop_goal",
   "update_goal",
   "update_goal_objective",
@@ -78,6 +77,7 @@ function controlledStream() {
           item.processed?.()
           continue
         }
+        if (ended) return
         await new Promise<void>((resolve) => waiters.push(resolve))
       }
     },
@@ -143,7 +143,7 @@ function makeMockContext(
     },
   })
   return {
-    options,
+    options: { min_continue_interval_seconds: 0, ...options },
     location,
     promptCalls,
     tools,
@@ -265,6 +265,8 @@ async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
     disposed = true
     const index = setupDisposers.indexOf(dispose)
     if (index >= 0) setupDisposers.splice(index, 1)
+    // An async generator parked on its waiter ignores return(); end the mock stream so cleanup is not held to its 2s cap.
+    ;(args[0] as { stream?: { end(): void } }).stream?.end()
     await cleanup()
   }
   setupDisposers.push(dispose)
@@ -282,8 +284,8 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-test("default export exposes both V1 server and V2 setup", () => {
-  expect(typeof plugin.server).toBe("function")
+test("default export exposes only V2 setup", () => {
+  expect("server" in plugin).toBe(false)
   expect(typeof plugin.setup).toBe("function")
   expect(plugin.id).toBe("local.goal-mode.server")
 })
@@ -308,6 +310,21 @@ test("V2 ordinary tool hooks work when another session wrote planless version 3 
   }
   expect(await readFile(file, "utf8")).toBe(content)
   expect(await getGoal("ses_existing")).toMatchObject({ objective: "preserve the other session", plan: null, planRevision: 0 })
+})
+
+test("control commands apply state before acknowledgement and reject Plan-mode resume", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "control goal")
+  const command = mock.commands.find((item) => item.name === "goal")!
+  mock.session.prompt = async () => { throw new Error("acknowledgement unavailable") }
+  await expect(command.execute({ sessionID: "ses_v2", prompt: { text: "pause" }, delivery: "steer" })).rejects.toThrow("acknowledgement unavailable")
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  mock.session.get = async () => ({ data: { agent: "plan" } } as never)
+  await expect(command.execute({ sessionID: "ses_v2", prompt: { text: "resume" }, delivery: "steer" })).rejects.toThrow("Plan")
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  await expect(command.execute({ sessionID: "ses_v2", prompt: { text: "clear" }, delivery: "steer" })).rejects.toThrow("acknowledgement unavailable")
+  expect(await getGoal("ses_v2")).toBeNull()
 })
 
 test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and {content} executors", async () => {
@@ -343,7 +360,7 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
 
 test("V2 stop, replace, clear, and history tools preserve prior goals", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "first")
 
   expect(contentOf(await goalTool(mock, "stop_goal").execute({}, toolContext()))).toContain('"status": "cancelled"')
@@ -354,23 +371,17 @@ test("V2 stop, replace, clear, and history tools preserve prior goals", async ()
   const history = JSON.parse(contentOf(await goalTool(mock, "get_goal_history").execute({}, toolContext())))
   expect(history.goal).toBeNull()
   expect(history.previous_goals.map((goal: { objective: string }) => goal.objective)).toEqual(["first", "second"])
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 replacement continues the new goal after the command execution settles", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "old objective")
   await goalTool(mock, "replace_goal").execute({ objective: "new objective" }, toolContext())
 
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length === 1)
   expect(mock.promptCalls[0]?.text).toContain("new objective")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 for (const action of ["stop_goal", "clear_goal"] as const) {
@@ -408,7 +419,7 @@ test("V2 replacement during an in-flight continuation cannot mutate or overlap t
     })
     return { id: "old" }
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "old objective")
   void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length === 1)
@@ -420,14 +431,11 @@ test("V2 replacement during an in-flight continuation cannot mutate or overlap t
   await waitFor(() => mock.promptCalls.length === 2)
   expect(mock.promptCalls[1]?.text).toContain("new objective")
   expect(await getGoal("ses_v2")).toMatchObject({ objective: "new objective", autoTurns: 1 })
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 list_all_goals returns goals from other sessions", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await goalTool(mock, "create_goal").execute(
     { objective: "first V2 session goal" },
     toolContext("ses_first"),
@@ -443,49 +451,42 @@ test("V2 list_all_goals returns goals from other sessions", async () => {
   expect(contentOf(listed)).toContain('"sessionID": "ses_second"')
   expect(contentOf(listed)).not.toContain("usageTrackers")
   expect(contentOf(listed)).not.toContain("pendingAttempt")
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 create_goal recovers from a zero-filled state file", async () => {
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\u0000\u0000", "utf8")
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   const created = await createGoalViaV2Tool(mock, "recover V2 state")
 
   expect(contentOf(created)).toContain('"objective": "recover V2 state"')
   expect((await getGoal("ses_v2"))?.objective).toBe("recover V2 state")
   expect((await readdir(dir)).filter((name) => name.startsWith("goals.json.corrupt-"))).toHaveLength(1)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 create_goal reuses the same active objective without reinitializing state", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await goalTool(mock, "create_goal").execute(
     { objective: "finish V2 safely", token_budget: 100 },
     toolContext(),
   )
   const before = await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")
 
-  const duplicate = await goalTool(mock, "set_goal").execute(
+  const duplicate = await goalTool(mock, "create_goal").execute(
     { objective: " finish V2 safely ", token_budget: 999 },
     toolContext(),
   )
 
   expect(contentOf(duplicate)).toContain('"goal_reused": true')
-  expect(contentOf(duplicate)).toContain("Do not call create_goal or set_goal again")
+  expect(contentOf(duplicate)).toContain("Do not call create_goal again")
   expect(contentOf(duplicate)).toContain('"tokenBudget": 100')
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
   const conflict = await goalTool(mock, "create_goal").execute({ objective: "replace V2 goal" }, toolContext())
   expect(contentOf(conflict)).toContain('"goal_conflict": true')
-  expect(contentOf(conflict)).toContain("Do not call create_goal or set_goal again")
+  expect(contentOf(conflict)).toContain("Do not call create_goal again")
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 /goal waits across execution cycles and resolves when the overall goal closes", async () => {
@@ -705,6 +706,8 @@ test("V2 compact plan edits and reads avoid echoing the whole plan", async () =>
   expect(compactText).not.toContain("task-11-3")
   const summary = await goalTool(mock, "get_goal").execute({ view: "summary" }, toolContext())
   expect(JSON.stringify(summary)).not.toContain("task-11-3")
+  const defaultRead = await goalTool(mock, "get_goal").execute({}, toolContext())
+  expect(contentOf(defaultRead)).toBe(contentOf(summary))
   const full = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(JSON.stringify(full)).toContain("task-11-3")
   const blocked = await goalTool(mock, "update_goal_plan").execute({
@@ -846,7 +849,7 @@ test("V2 plan tool publishes JSON Schema with required fields and optional neste
 
 test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   const command = mock.commands.find((candidate) => candidate.name === "goal")
   const pause = mock.commands.find((candidate) => candidate.name === "pause_goal")
@@ -886,7 +889,7 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   expect(Object.hasOwn(mock.promptCalls[1]!, "files")).toBe(false)
   expect(Object.hasOwn(mock.promptCalls[1]!, "agents")).toBe(false)
   expect(Object.hasOwn(mock.promptCalls[1]!, "skills")).toBe(false)
-  expect(mock.promptCalls[1]?.text).toContain("If the arguments are empty, call get_goal")
+  expect(mock.promptCalls[1]?.text).toContain("Goal control has already been applied")
 
   await pause?.execute({
     sessionID: "ses_pause",
@@ -898,29 +901,27 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
     delivery: "steer",
   })
   expect(mock.promptCalls[2]?.agents).toBeUndefined()
-  expect(mock.promptCalls[2]?.text).toContain('command "/pause_goal" was invoked')
-  expect(mock.promptCalls[2]?.text).toContain('update_goal_status with status "paused"')
+  expect(mock.promptCalls[2]?.text).toContain("Goal control has already been applied")
+  expect(mock.promptCalls[2]?.text).toContain("Goal control has already been applied")
   expect(mock.promptCalls[2]?.text).not.toContain("ignored text")
 
   await resume?.execute({ sessionID: "ses_resume", prompt: { text: "ignored" }, delivery: "queue" })
   expect(mock.promptCalls[3]).toMatchObject({ sessionID: "ses_resume", delivery: "queue" })
-  expect(mock.promptCalls[3]?.text).toContain('command "/resume_goal" was invoked')
-  expect(mock.promptCalls[3]?.text).toContain('update_goal_status with status "active"')
-  expect(mock.promptCalls[3]?.text).toContain("Plan mode")
+  expect(mock.promptCalls[3]?.text).toContain("Goal control has already been applied")
+  expect(mock.promptCalls[3]?.text).toContain("Goal control has already been applied")
+  expect(mock.promptCalls[3]?.text).toContain("Goal control has already been applied")
   expect(mock.promptCalls[3]?.text).not.toContain("ignored")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 only renews the auto-turn window after an explicit resume command", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await goalTool(mock, "create_goal").execute(
     { objective: "continue through another window", max_auto_turns: 1 },
     toolContext("ses_resume_limit"),
   )
   await reserveContinuation("ses_resume_limit", 25, 0)
+  await recordContinuationResult("ses_resume_limit", "failure", 5)
   await reserveContinuation("ses_resume_limit", 25, 0)
 
   const statusTool = goalTool(mock, "update_goal_status")
@@ -936,14 +937,11 @@ test("V2 only renews the auto-turn window after an explicit resume command", asy
   await mock.hooks.prompt?.({ sessionID: "ses_resume_limit", prompt: resumePrompt })
   await statusTool.execute({ status: "active" }, toolContext("ses_resume_limit"))
   expect(await getGoal("ses_resume_limit")).toMatchObject({ status: "active", autoTurns: 0 })
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 goal command XML-escapes delimiter breakouts while preserving objective text", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   const command = mock.commands.find((candidate) => candidate.name === "goal")
 
   await command?.execute({
@@ -960,32 +958,26 @@ test("V2 goal command XML-escapes delimiter breakouts while preserving objective
     delivery: "steer",
   })
   expect(mock.promptCalls[1]?.text).toContain("ship &lt;safe&gt; objective")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 setup preserves existing commands and configured command-name collisions", async () => {
   const mock = makeMockContext({ auto_continue: false, command_name: "pause_goal" }, ["resume_goal"])
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   expect(mock.commands.map((command) => command.name)).toEqual(["goal", "pause_goal"])
   expect(mock.commands[0]?.description).toBe("Set or view the long-running session goal")
   expect(mock.commands[1]?.description).toBe("Pause the current long-running session goal")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 goal command omits undefined prompt fields and preserves empty attachment arrays", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   const command = mock.commands.find((candidate) => candidate.name === "goal")
 
   await command?.execute({
     sessionID: "ses_undefined_attachments",
     prompt: {
-      text: "",
+      text: "work with these attachments",
       files: undefined,
       agents: undefined,
       skills: undefined,
@@ -1004,66 +996,31 @@ test("V2 goal command omits undefined prompt fields and preserves empty attachme
 
   await command?.execute({
     sessionID: "ses_empty_attachments",
-    prompt: { text: "", files: [], agents: [], skills: [] },
+    prompt: { text: "work with empty attachments", files: [], agents: [], skills: [] },
     delivery: "queue",
   })
   expect(mock.promptCalls[1]?.files).toEqual([])
   expect(mock.promptCalls[1]?.agents).toEqual([])
   expect(mock.promptCalls[1]?.skills).toEqual([])
-
-  mock.stream.end()
-  await cleanup()
 })
 
-test("V2 prompt hook pauses compatibility commands before admission", async () => {
-  const mock = makeMockContext({ auto_continue: false }, ["goal", "pause_goal", "resume_goal"])
-  const cleanup = await setupPlugin(mock as never)
-  await createGoalViaV2Tool(mock, "pause before acknowledgement")
-  const v1 = await plugin.server({ client: { session: { promptAsync: async () => {} } } } as never, {
-    auto_continue: false,
-  })
-  const config = {} as { command?: Record<string, { template: string }> }
-  await v1.config?.(config as never)
-  const pauseTemplate = config.command?.pause_goal?.template
-  const resumeTemplate = config.command?.resume_goal?.template
-  if (!pauseTemplate) throw new Error("expected pause_goal compatibility command")
-  if (!resumeTemplate) throw new Error("expected resume_goal compatibility command")
-  await v1.dispose?.()
-  const input = {
-    sessionID: "ses_v2",
-    messageID: "msg_pause",
-    prompt: {
-      text: `${pauseTemplate}\nuntrusted arguments`,
-      files: [{ uri: "file:///tmp/untrusted.txt" }],
-      agents: [{ name: "plan" }],
-      skills: [{ id: "untrusted" }],
-    },
-    delivery: "steer",
-  }
-
-  await mock.hooks.prompt?.(input)
-
-  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", objective: "pause before acknowledgement" })
-  expect(input.prompt.text).toBe(pauseTemplate)
-  expect(input.prompt.files).toBeUndefined()
-  expect(input.prompt.agents).toBeUndefined()
-  expect(input.prompt.skills).toBeUndefined()
-
-  const resumeInput = {
-    sessionID: "ses_v2",
-    messageID: "msg_resume",
-    prompt: {
-      text: `${resumeTemplate}\nuntrusted arguments`,
-      files: [{ uri: "file:///tmp/untrusted.txt" }],
-    },
-    delivery: "steer",
-  }
-  await mock.hooks.prompt?.(resumeInput)
-  expect((await getGoal("ses_v2"))?.status).toBe("paused")
-  expect(resumeInput.prompt.text).toBe(resumeTemplate)
-  expect(resumeInput.prompt.files).toBeUndefined()
-  mock.stream.end()
-  await cleanup()
+test("human steering cancels stale preparation and continues the same active goal after the human turn", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "original objective")
+  const input = { sessionID: "ses_v2", prompt: { text: "Change direction. Ignore the previous approach." } }
+  await mock.hooks.prompt!(input)
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", objective: "original objective" })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(0)
+  expect(input.prompt.text).toContain("Change direction")
+  await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.text).toContain("original objective")
+  // Receiving our own continuation at the prompt boundary is not human steering.
+  await mock.hooks.prompt!({ sessionID: "ses_v2", prompt: mock.promptCalls[0] })
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
 
 test("V2 command transform remains stable when the registry replays it", async () => {
@@ -1078,20 +1035,18 @@ test("V2 command transform remains stable when the registry replays it", async (
       },
     }
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
 
   mock.commands.length = 0
   transform?.({ add: (command) => mock.commands.push(command) })
 
   expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 pause_goal persists the pause before prompting and ignores attachments", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "wait for remote guidance")
   let statusAtPrompt: string | undefined
   mock.session.prompt = async (input) => {
@@ -1119,9 +1074,6 @@ test("V2 pause_goal persists the pause before prompting and ignores attachments"
   expect(mock.promptCalls[0]?.agents).toBeUndefined()
   expect(mock.promptCalls[0]?.skills).toBeUndefined()
   expect(mock.promptCalls[0]?.text).not.toContain("replace the goal")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("max_objective_chars is advertised and enforced per V2 instance", async () => {
@@ -1135,7 +1087,7 @@ test("max_objective_chars is advertised and enforced per V2 instance", async () 
   expect(v2TextSchema(wide, "create_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
   expect(v2TextSchema(narrow, "create_goal", "objective")).toMatchObject({ maxLength: 10, pattern: "\\S" })
   expect(v2TextSchema(defaulted, "create_goal", "objective")).toMatchObject({ maxLength: 100_000, pattern: "\\S" })
-  expect(v2TextSchema(wide, "set_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "create_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
   expect(v2TextSchema(wide, "update_goal_objective", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
   expect(v2TextSchema(wide, "update_goal", "evidence")).toMatchObject({ maxLength: 100, pattern: "\\S" })
   expect(v2TextSchema(wide, "update_goal", "blocker")).toMatchObject({ maxLength: 100, pattern: "\\S" })
@@ -1181,20 +1133,21 @@ test("max_objective_chars is advertised and enforced per V2 instance", async () 
 
 test("V2 setup skips command registration when register_command is false", async () => {
   const mock = makeMockContext({ auto_continue: false, register_command: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   expect(mock.commands).toHaveLength(0)
   expect(mock.disposals).not.toContain("command.transform")
-  expect(mock.hooks.prompt).toBeUndefined()
-
-  mock.stream.end()
-  await cleanup()
+  expect(mock.hooks.prompt).toBeTypeOf("function")
 })
 
-test("V2 session context hook injects the goal-mode system reminder", async () => {
+test("V2 session context hook injects policy only for sessions with goals", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
+  const unrelated = { sessionID: "ses_other", system: [] }
+  await mock.hooks.context!(unrelated)
+  expect(unrelated.system).toEqual([])
+  await createGoalViaV2Tool(mock, "context policy")
   const contextHook = mock.hooks["context"]!
   expect(contextHook).toBeTypeOf("function")
   const sessionContext = { sessionID: "ses_v2", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
@@ -1204,14 +1157,11 @@ test("V2 session context hook injects the goal-mode system reminder", async () =
   // The reminder is not duplicated on a second hook invocation.
   await contextHook(sessionContext)
   expect(sessionContext.system).toHaveLength(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 compaction hook preserves the active goal for the summarizer", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "Ship the compaction-safe goal feature")
 
   const compactionHook = mock.hooks["compaction"]!
@@ -1232,12 +1182,9 @@ test("V2 compaction hook preserves the active goal for the summarizer", async ()
   // Without a goal, compaction uses the same system policy as ordinary requests.
   const foreign = { sessionID: "ses_other", agent: "build", system: [] as Array<{ type: string; text: string }>, messages: [], tools: {} }
   await compactionHook(foreign)
-  expect(foreign.system).toEqual(ordinary.system)
+  expect(foreign.system).toEqual([])
   await compactionHook(foreign)
-  expect(foreign.system).toEqual(ordinary.system)
-
-  mock.stream.end()
-  await cleanup()
+  expect(foreign.system).toEqual([])
 })
 
 test("V2 rebuilds task deferral from session transcripts after a plugin restart", async () => {
@@ -1286,14 +1233,11 @@ test("V2 only reads recovery transcripts for goals owned by the plugin location"
       ses_foreign: { location: { directory: "/work/other", workspaceID: "workspace-other" } },
     },
   )
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   await waitFor(() => mock.sessionGetCalls.includes("ses_local") && mock.sessionGetCalls.includes("ses_foreign"))
   await waitFor(() => mock.contextCalls.includes("ses_local"))
   expect(mock.contextCalls).toEqual(["ses_local"])
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 skips cancelled goals during transcript recovery", async () => {
@@ -1301,28 +1245,100 @@ test("V2 skips cancelled goals during transcript recovery", async () => {
   await cancelGoal("ses_cancelled")
   await createGoal("ses_active", "Recover this active goal")
   const mock = makeMockContext({}, [], { ses_cancelled: [], ses_active: [] })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   await waitFor(() => mock.contextCalls.includes("ses_active"))
   expect(mock.contextCalls).toEqual(["ses_active"])
   expect(mock.sessionGetCalls).not.toContain("ses_cancelled")
+})
 
-  mock.stream.end()
-  await cleanup()
+test("two V2 server instances observing the same idle reserve only one prompt", async () => {
+  await createGoal("ses_v2", "Shared goal", { maxAutoTurns: 1 })
+  const servers = [makeMockContext({ min_continue_interval_seconds: 0 }), makeMockContext({ min_continue_interval_seconds: 0 })]
+  for (const server of servers) await setupPlugin(server as never)
+  await Promise.all(servers.map((server) => server.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })))
+  expect(servers.flatMap((server) => server.promptCalls)).toHaveLength(1)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
+})
+
+test.each(["completed", "error"])("V2 waits for outstanding tool work until execute.after reports %s", async (status) => {
+  await createGoal("ses_v2", "Wait for the tool")
+  const mock = makeMockContext({ defer_while_tasks_active: false })
+  await setupPlugin(mock as never)
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "waiting" })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(0)
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", autoTurns: 0 })
+  await mock.hooks["execute.after"]!({ tool: "bash", sessionID: "ses_v2", id: "waiting", status, result: { content: [] } })
+  await waitFor(() => mock.promptCalls.length === 1)
+})
+
+test("two V2 watchdogs reserve only one untracked rescue", async () => {
+  await createGoal("ses_v2", "Shared busy goal")
+  const servers = [makeMockContext({ max_turn_time: 0.02 }), makeMockContext({ max_turn_time: 0.02 })]
+  for (const server of servers) await setupPlugin(server as never)
+  await Promise.all(servers.map((server) => server.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })))
+  await waitFor(() => servers.flatMap((server) => server.promptCalls).length > 0)
+  await Bun.sleep(100)
+  expect(servers.flatMap((server) => server.promptCalls)).toHaveLength(1)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+})
+
+test("V2 watchdog does not interrupt a running tool", async () => {
+  await createGoal("ses_v2", "Wait for legitimate work")
+  const mock = makeMockContext({ max_turn_time: 0.02 })
+  await setupPlugin(mock as never)
+  await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "slow" })
+  await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await Bun.sleep(100)
+  expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 waits for a running shell in the host transcript after the turn ends", async () => {
+  await createGoal("ses_v2", "Wait for shell completion")
+  const transcript = [{ type: "shell", shellID: "shell_wait", status: "running" }]
+  const mock = makeMockContext({}, [], { ses_v2: transcript })
+  await setupPlugin(mock as never)
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+  transcript[0]!.status = "exited"
+  await mock.stream.push({ type: "shell.exited", created: Date.now(), data: { id: "shell_wait", status: "exited", exit: 0 } })
+  await waitFor(() => mock.promptCalls.length === 1)
+})
+
+test("V2 recovers background shell waits from completed tool metadata", async () => {
+  await createGoal("ses_v2", "Wait for background work across reloads")
+  const transcript: unknown[] = [{ type: "assistant", id: "background", content: [{ type: "tool", name: "shell", state: { status: "completed", content: [], metadata: { status: "running", shellID: "sh_background" } } }] }]
+  const mock = makeMockContext({}, [], { ses_v2: transcript })
+  await setupPlugin(mock as never)
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+  transcript.push({ type: "synthetic", text: '<shell id="sh_background" state="completed" command="sleep 3">\n(no output)\n</shell>' })
+  await waitFor(() => mock.promptCalls.length === 1)
+})
+
+test.each(["shell.exited", "shell.deleted"])("V2 releases a live background shell wait on %s", async (type) => {
+  await createGoal("ses_v2", "Wait for the background process")
+  const mock = makeMockContext()
+  await setupPlugin(mock as never)
+  await mock.stream.push({ type: "shell.created", created: Date.now(), data: { info: { id: "sh_live", status: "running", metadata: { sessionID: "ses_v2" } } } })
+  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  expect(mock.promptCalls).toHaveLength(0)
+  await mock.stream.push({ type, created: Date.now(), data: { id: "sh_live", status: "exited" } })
+  await waitFor(() => mock.promptCalls.length === 1)
 })
 
 test("V2 continuation proceeds after restart when transcripts show no blocking tasks", async () => {
   await createGoal("ses_v2", "Verify continuation without recovered tasks")
   const mock = makeMockContext({}, [], { ses_v2: [] })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await waitFor(() => mock.contextCalls.includes("ses_v2"))
 
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length > 0)
   expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 defers continuation until transcript recovery completes when a settled event races the recovery", async () => {
@@ -1365,7 +1381,7 @@ test("V2 defers continuation until transcript recovery completes when a settled 
   })
 })
 
-test("V2 reconciles a transcript-terminal task via a later assistant message and continues", async () => {
+test.each(["completed", "error"])("V2 reconciles a transcript-terminal %s task via a later assistant message and continues", async (state) => {
   await createGoal("ses_v2", "Verify terminal task reconciliation from transcripts")
   const transcript = [
     {
@@ -1378,7 +1394,7 @@ test("V2 reconciles a transcript-terminal task via a later assistant message and
           type: "tool",
           id: "call_done",
           name: "task",
-          state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_done\nstate: completed" }] },
+          state: { status: "completed", input: {}, content: [{ type: "text", text: `task_id: T_done\nstate: ${state}` }] },
         },
       ],
     },
@@ -1387,61 +1403,21 @@ test("V2 reconciles a transcript-terminal task via a later assistant message and
       type: "assistant",
       agent: "build",
       time: { created: 3, completed: 4 },
-      content: [{ type: "text", text: "The tracked task finished; summarizing its results." }],
+      content: [{ type: "text", text: "The tracked task finished; recording the outcome." }],
     },
   ]
   const mock = makeMockContext({}, [], { ses_v2: transcript })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await waitFor(() => mock.contextCalls.includes("ses_v2"))
 
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length > 0)
   expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
-
-  mock.stream.end()
-  await cleanup()
-})
-
-test("V2 reconciles a transcript-terminal failed task via a later assistant message and continues", async () => {
-  await createGoal("ses_v2", "Verify failed task reconciliation from transcripts")
-  const transcript = [
-    {
-      id: "msg_tool_fail",
-      type: "assistant",
-      agent: "build",
-      time: { created: 1, completed: 2 },
-      content: [
-        {
-          type: "tool",
-          id: "call_fail",
-          name: "task",
-          state: { status: "completed", input: {}, content: [{ type: "text", text: "task_id: T_fail\nstate: error" }] },
-        },
-      ],
-    },
-    {
-      id: "msg_after_fail",
-      type: "assistant",
-      agent: "build",
-      time: { created: 3, completed: 4 },
-      content: [{ type: "text", text: "The tracked task failed; recording the error." }],
-    },
-  ]
-  const mock = makeMockContext({}, [], { ses_v2: transcript })
-  const cleanup = await setupPlugin(mock as never)
-  await waitFor(() => mock.contextCalls.includes("ses_v2"))
-
-  await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitFor(() => mock.promptCalls.length > 0)
-  expect(mock.promptCalls[0]!.text).toContain("Continue working toward the active session goal")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 setup registers tool execute hooks", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   expect(mock.hooks["execute.before"]).toBeTypeOf("function")
   expect(mock.hooks["execute.after"]).toBeTypeOf("function")
@@ -1453,14 +1429,11 @@ test("V2 setup registers tool execute hooks", async () => {
     status: "completed",
     result: { output: '<task id="t1" state="running">launch</task>' },
   })
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 events account usage and checkpoints from step/usage events", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "account usage from events")
 
   // Step events drive per-step token sums and checkpoints.
@@ -1491,11 +1464,11 @@ test("V2 events account usage and checkpoints from step/usage events", async () 
   })
 
   await waitFor(async () => {
-    const read = await goalTool(mock, "get_goal").execute({}, toolContext())
+    const read = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
     const content = contentOf(read)
     return content.includes('"tokensUsed": 70') && content.includes("IMPLEMENTED_THE_FEATURE")
   })
-  const readAfterStep = await goalTool(mock, "get_goal").execute({}, toolContext())
+  const readAfterStep = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(contentOf(readAfterStep)).toContain('"tokensUsed": 70')
   expect(contentOf(readAfterStep)).toContain("IMPLEMENTED_THE_FEATURE")
 
@@ -1519,19 +1492,16 @@ test("V2 events account usage and checkpoints from step/usage events", async () 
     created: Date.now(),
     data: { sessionID: "ses_v2", tokens: { input: 215, output: 50, reasoning: 0, cache: { read: 10, write: 0 } } },
   })
-  await waitFor(async () => contentOf(await goalTool(mock, "get_goal").execute({}, toolContext())).includes('"tokensUsed": 85'))
+  await waitFor(async () => contentOf(await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())).includes('"tokensUsed": 85'))
 
-  const read = await goalTool(mock, "get_goal").execute({}, toolContext())
+  const read = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(contentOf(read)).toContain('"tokensUsed": 85')
   expect(contentOf(read)).toContain("IMPLEMENTED_THE_FEATURE")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 step accounting excludes steps observed before goal creation", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   mock.stream.push({
     type: "session.step.ended",
@@ -1560,14 +1530,11 @@ test("V2 step accounting excludes steps observed before goal creation", async ()
 
   await waitFor(async () => (await getGoal("ses_v2"))?.tokensUsed === 300)
   expect(await getGoal("ses_v2")).toMatchObject({ status: "active", tokensUsed: 300 })
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 step and session sources do not double-count when session usage arrives first", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "reconcile usage sources")
 
   mock.stream.push({
@@ -1592,14 +1559,11 @@ test("V2 step and session sources do not double-count when session usage arrives
 
   await waitFor(async () => (await getGoal("ses_v2"))?.tokensUsed === 300)
   expect((await getGoal("ses_v2"))?.tokensUsed).toBe(300)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 failed steps account usage and replace stale assistant progress", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "survive a failed model step")
 
   mock.stream.push({
@@ -1627,14 +1591,11 @@ test("V2 failed steps account usage and replace stale assistant progress", async
     const goal = await getGoal("ses_v2")
     return goal?.lastAssistantMessageID === "msg_failed" && goal.tokensUsed === 30
   })
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 execution success continues an active goal and starts the delivered attempt", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "continue after the current V2 runner settles")
 
   mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -1644,23 +1605,18 @@ test("V2 execution success continues an active goal and starts the delivered att
   mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
   await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 global execution events only continue goals in the plugin instance location", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0 })
   const location = { directory: "/workspace/albus", workspaceID: "workspace_a" }
-  const cleanup = await setupPlugin({ ...mock, location } as never)
+  await setupPlugin({ ...mock, location } as never)
   await createGoalViaV2Tool(mock, "only the owning location may continue this session")
   await mock.stream.push({ type: "session.execution.succeeded", created: 1, location: { ...location, directory: "/workspace/other" }, data: { sessionID: "ses_v2" } })
   await mock.stream.push({ type: "session.execution.succeeded", created: 2, location: { ...location, workspaceID: "workspace_b" }, data: { sessionID: "ses_v2" } })
   expect(mock.promptCalls).toHaveLength(0)
   await mock.stream.push({ type: "session.execution.succeeded", created: 3, location, data: { sessionID: "ses_v2" } })
   expect(mock.promptCalls).toHaveLength(1)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 envelope-less session events stay foreign to sibling location instances", async () => {
@@ -1751,7 +1707,7 @@ test("V2 envelope-less session events stay foreign to sibling location instances
 
 test("V2 fast execution success schedules the next continuation after the minimum interval", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "do not strand a fast continuation")
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   expect(mock.promptCalls).toHaveLength(1)
@@ -1773,13 +1729,11 @@ test("V2 fast execution success schedules the next continuation after the minimu
   mock.session.wait = async () => {}
   await waitFor(() => mock.promptCalls.length === 2, 3000)
   expect((await getGoal("ses_v2"))!.lastContinuationAt! - first).toBeGreaterThanOrEqual(1)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 timed continuation waits for a live run boundary even when busy events are missing", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "wait for the host run boundary")
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   expect(mock.promptCalls).toHaveLength(1)
@@ -1799,13 +1753,11 @@ test("V2 timed continuation waits for a live run boundary even when busy events 
   expect(mock.promptCalls).toHaveLength(1)
   releaseWait()
   await waitFor(() => mock.promptCalls.length === 2)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "auto-continue from idle events")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -1815,11 +1767,8 @@ test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => 
   expect(mock.promptCalls[0]?.text).toContain("Continue working toward the active session goal")
   expect(mock.promptCalls[0]?.agents).toEqual([{ name: "build" }])
 
-  const read = await goalTool(mock, "get_goal").execute({}, toolContext())
+  const read = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(contentOf(read)).toContain('"autoTurns": 1')
-
-  mock.stream.end()
-  await cleanup()
 })
 
 for (const state of ["paused", "plan", "complete", "unmet", "cancelled", "disabled"] as const) {
@@ -1842,7 +1791,7 @@ for (const state of ["paused", "plan", "complete", "unmet", "cancelled", "disabl
 
 test("V2 JSON-encoded idle event triggers auto-continue", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "auto-continue from encoded idle events")
 
   mock.stream.push("not JSON")
@@ -1851,14 +1800,11 @@ test("V2 JSON-encoded idle event triggers auto-continue", async () => {
   await waitFor(() => mock.promptCalls.length === 1)
   expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 idle continuation waits for a running child session", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "wait for delegated work")
 
   mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
@@ -1869,9 +1815,6 @@ test("V2 idle continuation waits for a running child session", async () => {
   mock.stream.push({ type: "session.deleted", created: 102, data: { sessionID: "child" } })
   mock.stream.push({ type: "session.idle", created: 103, data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length === 1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 running child session stops blocking after the task block ceiling", async () => {
@@ -1896,10 +1839,15 @@ test("V2 running child session stops blocking after the task block ceiling", asy
 // "No prompt was sent" cannot distinguish a stopped loop from a running one here - a
 // cleared goal is refused later in runAutoContinue either way - so these lifecycle tests
 // count the re-arm timers, which are the resource the fix is about.
-test("V2 task deferral stops re-arming when the goal is cleared while a child still blocks", async () => {
+test.each([
+  ["cleared", "clear_goal", {}, null],
+  ["paused", "update_goal_status", { status: "paused" }, "paused"],
+  // A closed goal can never be resumed, so the poll has nothing to wake up for even in principle.
+  ["completed", "update_goal", { status: "complete", evidence: "delegated work is no longer needed" }, "complete"],
+] as const)("V2 task deferral stops re-arming when the goal is %s while a child still blocks", async (_label, tool, args, expectedStatus) => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0 })
   await countTaskBlockRearms(async (rearms, realSetTimeout) => {
-    const cleanup = await setupPlugin(mock as never)
+    await setupPlugin(mock as never)
     await createGoalViaV2Tool(mock, "wait for delegated work")
 
     mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
@@ -1909,73 +1857,15 @@ test("V2 task deferral stops re-arming when the goal is cleared while a child st
     await waitFor(() => rearms() >= 2, 10_000)
     expect(mock.promptCalls).toHaveLength(0)
 
-    await goalTool(mock, "clear_goal").execute({}, toolContext())
-    expect(await getGoalInternal("ses_v2")).toBeNull()
+    await goalTool(mock, tool).execute(args, toolContext())
+    expect((await getGoalInternal("ses_v2"))?.status ?? null).toBe(expectedStatus)
 
     // Let any in-flight re-arm land, then confirm the loop has genuinely stopped.
     await new Promise((resolve) => realSetTimeout(resolve, 1_500))
-    const rearmsAfterClear = rearms()
+    const rearmsAfterStop = rearms()
     await new Promise((resolve) => realSetTimeout(resolve, 3_000))
-    expect(rearms()).toBe(rearmsAfterClear)
+    expect(rearms()).toBe(rearmsAfterStop)
     expect(mock.promptCalls).toHaveLength(0)
-
-    mock.stream.end()
-    await cleanup()
-  })
-}, 30_000)
-
-test("V2 task deferral stops re-arming when the goal is paused while a child still blocks", async () => {
-  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
-  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
-    const cleanup = await setupPlugin(mock as never)
-    await createGoalViaV2Tool(mock, "wait for delegated work")
-
-    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
-    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
-    await waitFor(() => rearms() >= 2, 10_000)
-    expect(mock.promptCalls).toHaveLength(0)
-
-    await goalTool(mock, "update_goal_status").execute({ status: "paused" }, toolContext())
-    expect((await getGoalInternal("ses_v2"))?.status).toBe("paused")
-
-    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
-    const rearmsAfterPause = rearms()
-    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
-    expect(rearms()).toBe(rearmsAfterPause)
-    expect(mock.promptCalls).toHaveLength(0)
-
-    mock.stream.end()
-    await cleanup()
-  })
-}, 30_000)
-
-test("V2 task deferral stops re-arming when the goal is completed while a child still blocks", async () => {
-  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
-  await countTaskBlockRearms(async (rearms, realSetTimeout) => {
-    const cleanup = await setupPlugin(mock as never)
-    await createGoalViaV2Tool(mock, "wait for delegated work")
-
-    mock.stream.push({ type: "session.created", created: 100, data: { sessionID: "child", parentID: "ses_v2" } })
-    mock.stream.push({ type: "session.idle", created: 101, data: { sessionID: "ses_v2" } })
-    await waitFor(() => rearms() >= 2, 10_000)
-    expect(mock.promptCalls).toHaveLength(0)
-
-    // Unlike a pause, a closed goal can never be resumed, so the poll has nothing to
-    // wake up for even in principle.
-    await goalTool(mock, "update_goal").execute(
-      { status: "complete", evidence: "delegated work is no longer needed" },
-      toolContext(),
-    )
-    expect((await getGoalInternal("ses_v2"))?.status).toBe("complete")
-
-    await new Promise((resolve) => realSetTimeout(resolve, 1_500))
-    const rearmsAfterComplete = rearms()
-    await new Promise((resolve) => realSetTimeout(resolve, 3_000))
-    expect(rearms()).toBe(rearmsAfterComplete)
-    expect(mock.promptCalls).toHaveLength(0)
-
-    mock.stream.end()
-    await cleanup()
   })
 }, 30_000)
 
@@ -2046,18 +1936,15 @@ test("V2 task deferral keeps re-arming a limited goal until its wrap-up is spent
 
 test("V2 idle auto-continue is suppressed for plan-agent goals", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "plan-mode goal must stay paused", "plan")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
   await new Promise((resolve) => setTimeout(resolve, 50))
 
   expect(mock.promptCalls).toHaveLength(0)
-  const read = await goalTool(mock, "get_goal").execute({}, toolContext())
+  const read = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(contentOf(read)).toContain('"status": "paused"')
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 cleanup disposes registrations and stops the event consumer", async () => {
@@ -2086,13 +1973,13 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
     data: { sessionID: "ses_v2", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } },
   })
   await new Promise((resolve) => setTimeout(resolve, 30))
-  const read = await goalTool(mock, "get_goal").execute({}, toolContext())
+  const read = await goalTool(mock, "get_goal").execute({ view: "full" }, toolContext())
   expect(contentOf(read)).toContain('"tokensUsed": 0')
 })
 
 test("V2 execution failure schedules bounded recovery without a phantom failure", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "recover from a transport error")
 
   mock.stream.push({
@@ -2106,9 +1993,6 @@ test("V2 execution failure schedules bounded recovery without a phantom failure"
   expect(goal?.continuationFailures).toBe(0)
   expect(goal?.autoTurns).toBe(1)
   expect(goal?.status).toBe("active")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 timed-out idle check retries and clears an older busy marker at the live boundary", async () => {
@@ -2122,7 +2006,7 @@ test("V2 timed-out idle check retries and clears an older busy marker at the liv
       })
     }
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "recover after the host settles")
   await mock.stream.push({
     type: "session.execution.failed",
@@ -2140,14 +2024,12 @@ test("V2 timed-out idle check retries and clears an older busy marker at the liv
   // event reaching this plugin instance to clear its older busy marker.
   await waitFor(() => mock.promptCalls.length === 1, 3000)
   expect(waitCalls).toBe(2)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 recovery remains available on hosts without a session wait method", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
   mock.session.wait = undefined as never
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "recover on an older host")
   await mock.stream.push({
     type: "session.execution.failed",
@@ -2155,8 +2037,6 @@ test("V2 recovery remains available on hosts without a session wait method", asy
     data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
   })
   await waitFor(() => mock.promptCalls.length === 1)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 idle after a started pending attempt counts one unresolved failure and pauses at the ceiling", async () => {
@@ -2166,7 +2046,7 @@ test("V2 idle after a started pending attempt counts one unresolved failure and 
     max_auto_turns: 5,
     max_prompt_failures: 1,
   })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "detect a no response")
 
   mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
@@ -2181,9 +2061,6 @@ test("V2 idle after a started pending attempt counts one unresolved failure and 
   mock.stream.push({ type: "session.idle", created: 3, data: { sessionID: "ses_v2" } })
   await waitFor(async () => (await getGoal("ses_v2"))?.status === "paused")
   expect((await getGoal("ses_v2"))?.continuationFailures).toBe(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 persists the attempt before the prompt resolves so a later busy can correlate", async () => {
@@ -2195,7 +2072,7 @@ test("V2 persists the attempt before the prompt resolves so a later busy can cor
       resolvePrompt = resolve
     })
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "correlate a racing busy")
 
   void mock.stream.push({ type: "session.idle", created: 1, data: { sessionID: "ses_v2" } })
@@ -2215,14 +2092,11 @@ test("V2 persists the attempt before the prompt resolves so a later busy can cor
   mock.stream.push({ type: "session.status", created: 2, data: { sessionID: "ses_v2", status: { type: "busy" } } })
   await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.started === true)
   expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.started).toBe(true)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 native retry cancels the execution watchdog until execution settles", async () => {
   const mock = makeMockContext({ max_turn_time: 0.02, min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "do not compete with native provider retries")
   mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
   mock.stream.push({ type: "session.retry.scheduled", created: 2, data: { sessionID: "ses_v2", attempt: 2, at: Date.now() + 1000 } })
@@ -2232,8 +2106,6 @@ test("V2 native retry cancels the execution watchdog until execution settles", a
 
   mock.stream.push({ type: "session.execution.succeeded", created: 3, data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length === 1)
-  mock.stream.end()
-  await cleanup()
 })
 
 for (const reason of ["shutdown", "superseded"]) {
@@ -2297,6 +2169,7 @@ for (const status of ["paused", "plan", "budgetLimited", "usageLimited"] as cons
     if (status === "budgetLimited") await accountUsage("ses_v2", 2)
     if (status === "usageLimited") {
       await reserveContinuation("ses_v2", 1, 0)
+      await recordContinuationResult("ses_v2", "failure", 5)
       await reserveContinuation("ses_v2", 1, 0)
     }
     const before = await getGoalInternal("ses_v2")
@@ -2358,7 +2231,7 @@ test("V2 cancellation rejects late recovery results without affecting a replacem
 
 test("V2 terminal execution transport failure recovers after native retries and respects the failure ceiling", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0, max_prompt_failures: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "bounded recovery after the host gives up retrying")
   mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
   mock.stream.push({ type: "session.retry.scheduled", created: 2, data: { sessionID: "ses_v2", attempt: 2 } })
@@ -2372,13 +2245,11 @@ test("V2 terminal execution transport failure recovers after native retries and 
   await waitFor(async () => (await getGoal("ses_v2"))?.status === "paused")
   expect((await getGoal("ses_v2"))?.continuationFailures).toBe(1)
   expect(mock.promptCalls).toHaveLength(1)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 terminal configuration failures stop recovery and compatibility idle continuation", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 0, max_turn_time: 0.02 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "do not retry a terminal configuration error")
   mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
   await mock.stream.push({ type: "session.execution.failed", created: 2, data: { sessionID: "ses_v2", error: { message: "invalid provider configuration" } } })
@@ -2386,13 +2257,11 @@ test("V2 terminal configuration failures stop recovery and compatibility idle co
   await new Promise((resolve) => setTimeout(resolve, 100))
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getGoal("ses_v2"))?.continuationFailures).toBe(0)
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 retry status cancels scheduled transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "let the native retry win")
 
   mock.stream.push({
@@ -2405,14 +2274,11 @@ test("V2 retry status cancels scheduled transport recovery", async () => {
 
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getGoal("ses_v2"))?.continuationFailures).toBe(0)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 successful tool progress cancels no-pending transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "cancel recovery via tool progress")
 
   mock.stream.push({
@@ -2454,14 +2320,11 @@ test("V2 successful tool progress cancels no-pending transport recovery", async 
 
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getGoal("ses_v2"))?.continuationFailures).toBe(0)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 assistant progress cancels no-pending transport recovery", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "cancel recovery via assistant progress")
 
   mock.stream.push({
@@ -2488,14 +2351,11 @@ test("V2 assistant progress cancels no-pending transport recovery", async () => 
   await new Promise((resolve) => setTimeout(resolve, 100))
 
   expect(mock.promptCalls).toHaveLength(0)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets", async () => {
   const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "watchdog should not eat the budget")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
@@ -2503,14 +2363,11 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
 
   expect(mock.promptCalls).toHaveLength(1)
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
   const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
 
   await mock.stream.push({
     type: "session.status",
@@ -2521,21 +2378,17 @@ test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
   await waitFor(() => mock.promptCalls.length === 1)
 
   expect(mock.promptCalls[0]?.text).toContain("rescue this same creation turn")
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 watchdog uses the configured zh-CN locale for its rescue prompt", async () => {
   const mock = makeMockContext({ auto_continue: false, locale: "zh-CN", max_turn_time: 0.02 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "继续国际化")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
   await waitFor(() => mock.promptCalls.length === 1)
 
   expect(JSON.stringify(mock.promptCalls[0])).toContain("继续推进当前会话的活动目标")
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 non-transport prompt errors do not count toward the ceiling or retry", async () => {
@@ -2543,7 +2396,7 @@ test("V2 non-transport prompt errors do not count toward the ceiling or retry", 
   mock.session.prompt = async () => {
     throw new Error("invalid provider configuration")
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "non-transport must be ignored")
 
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
@@ -2552,14 +2405,11 @@ test("V2 non-transport prompt errors do not count toward the ceiling or retry", 
   const goal = await getGoal("ses_v2")
   expect(goal?.continuationFailures).toBe(0)
   expect(goal?.status).toBe("active")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 execution.failed after a native retry episode still recovers", async () => {
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "native retry must not strand the goal")
 
   // retry arrives before the terminal failure; execution.failed is emitted only
@@ -2575,14 +2425,11 @@ test("V2 execution.failed after a native retry episode still recovers", async ()
   const goal = await getGoal("ses_v2")
   expect(goal?.continuationFailures).toBe(0)
   expect(goal?.status).toBe("active")
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 watchdog no-response counts a failure on idle even with auto_continue false", async () => {
   const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5, max_auto_turns: 1 })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "watchdog no response with auto-continue disabled")
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
@@ -2605,14 +2452,11 @@ test("V2 watchdog no-response counts a failure on idle even with auto_continue f
   expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
   await new Promise((resolve) => setTimeout(resolve, 50))
   expect(mock.promptCalls).toHaveLength(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 delayed tool output from a prior turn cannot clear a newer pending attempt", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "correlate tool progress to the attempt")
 
   // The tool call starts while attempt A is pending; the before hook captures
@@ -2624,6 +2468,8 @@ test("V2 delayed tool output from a prior turn cannot clear a newer pending atte
   await mock.hooks["execute.before"]!({ tool: "bash", sessionID: "ses_v2", id: "call_delayed", input: {} })
 
   // A newer attempt B is reserved while the tool is still running.
+  // Simulate external recovery resolving A before B is reserved.
+  await recordContinuationResult("ses_v2", "failure", 5)
   await reserveContinuation("ses_v2", 10, 0)
   await recordContinuationResult("ses_v2", "success", 5)
   const attemptB = (await getGoalInternal("ses_v2"))?.pendingAttempt?.id
@@ -2649,9 +2495,6 @@ test("V2 delayed tool output from a prior turn cannot clear a newer pending atte
     result: { output: "more progress" },
   })
   expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toBeNull()
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 dispose during an in-flight prompt rolls back the reserved attempt on rejection", async () => {
@@ -2694,7 +2537,7 @@ test("V2 commits an accepted prompt when its recovery timer is canceled in fligh
       resolvePrompt = resolve
     })
   }
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "commit accepted recovery")
 
   mock.stream.push({
@@ -2719,14 +2562,11 @@ test("V2 commits an accepted prompt when its recovery timer is canceled in fligh
   await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.delivered === true)
   expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
   expect(mock.promptCalls).toHaveLength(1)
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 completed tool failures do not clear retry state", async () => {
   const mock = makeMockContext({ auto_continue: false })
-  const cleanup = await setupPlugin(mock as never)
+  await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "keep failed tools from masking recovery")
 
   await reserveContinuation("ses_v2", 10, 0)
@@ -2752,9 +2592,6 @@ test("V2 completed tool failures do not clear retry state", async () => {
     expect(goal?.continuationFailures).toBe(1)
     expect(goal?.pendingAttempt?.id).toBe(attemptID)
   }
-
-  mock.stream.end()
-  await cleanup()
 })
 
 test("V2 command cancellation between idle cycles persists cancellation and stops the wait", async () => {
@@ -2806,7 +2643,7 @@ test("V2 wait failure pauses the goal and returns without hidden autonomous cont
   expect(mock.promptCalls).toHaveLength(1)
 })
 
-test("V2 planned scope edits need a matching explicit command and consume the grant once", async () => {
+test("V2 planned scope edits execute directly from an explicit command", async () => {
   const mock = makeMockContext({ auto_continue: false })
   await setupPlugin(mock as never)
   await createGoalViaV2Tool(mock, "Original full goal")
@@ -2833,11 +2670,9 @@ test("V2 planned scope edits need a matching explicit command and consume the gr
   await mock.commands
     .find((command) => command.name === "goal")!
     .execute({ sessionID: "ses_v2", prompt: { text: "edit New user scope & <checks>" }, delivery: "steer" })
-  await expect(
-    goalTool(mock, "update_goal_objective").execute({ objective: "Different unrequested scope" }, toolContext()),
-  ).rejects.toThrow("/goal edit")
-  await goalTool(mock, "update_goal_objective").execute({ objective: "New user scope &amp; &lt;checks&gt;" }, toolContext())
-  expect(await getGoal("ses_v2")).toMatchObject({ objective: "New user scope & <checks>", plan: null, planRevision: 2 })
+  expect(await getGoal("ses_v2")).toMatchObject({
+    objective: "New user scope & <checks>", plan: null, planRevision: 2, status: "paused",
+  })
   await goalTool(mock, "update_goal_plan").execute(
     { goal_id: goal.id, expected_revision: 2, plan, reason: "Plan the new scope" },
     toolContext(),
@@ -2879,6 +2714,73 @@ test("V2 a stopped event stream pauses a waiting goal rather than polling foreve
     .find((command) => command.name === "goal")!
     .execute({ sessionID: "ses_v2", prompt: { text: "Continue the goal" }, delivery: "steer" })
   expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(await getGoal("ses_v2")).toMatchObject({
+    stopReason: "event stream unavailable",
+    blocker: expect.stringContaining("after 3 reconnect attempts"),
+    lastStatus: expect.stringContaining("Reload the plugin"),
+  })
+  await expect(goalTool(mock, "create_goal").execute({ objective: "another goal" }, toolContext())).rejects.toThrow("Reload")
+  await expect(mock.commands.find((command) => command.name === "resume_goal")!.execute({
+    sessionID: "ses_v2", prompt: { text: "" }, delivery: "steer",
+  })).rejects.toThrow("Reload")
+})
+
+test("V2 retries subscription failures and resumes through the live idle barrier", async () => {
+  await createGoal("ses_v2", "recover event delivery", { agent: "build" })
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  let attempts = 0
+  mock.event.subscribe = () => {
+    attempts++
+    if (attempts === 1) return {
+      async *[Symbol.asyncIterator]() {
+        yield { type: "session.retry.scheduled", data: { sessionID: "ses_v2" } }
+        throw new Error("socket disconnected")
+      },
+    }
+    if (attempts === 2) throw new Error("socket disconnected")
+    return mock.stream
+  }
+  await setupPlugin(mock as never)
+  await waitFor(() => attempts === 3)
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", autoTurns: 1, continuationFailures: 0 })
+  expect((await getGoal("ses_v2"))?.history.some((entry) => entry.detail.includes("reconnecting 2/3"))).toBe(true)
+  expect(mock.promptCalls[0]?.text).toContain("recover event delivery")
+})
+
+test("V2 flapping streams exhaust retries without changing foreign or paused goals", async () => {
+  await createGoal("ses_v2", "owned", { agent: "build" })
+  await createGoal("ses_foreign", "foreign", { agent: "build" })
+  await createGoal("ses_paused", "user paused", { agent: "build" })
+  await setGoalStatus("ses_paused", "paused")
+  const location = { directory: "/project" }
+  const mock = makeMockContext({ auto_continue: false }, [], {}, location, {
+    ses_v2: { location }, ses_paused: { location }, ses_foreign: { location: { directory: "/elsewhere" } },
+  })
+  let attempts = 0
+  mock.event.subscribe = () => {
+    attempts++
+    return { async *[Symbol.asyncIterator]() { yield { type: "heartbeat", data: {} } } }
+  }
+  await setupPlugin(mock as never)
+  await waitFor(async () => (await getGoal("ses_v2"))?.status === "paused", 4500)
+  expect(attempts).toBe(4)
+  expect((await getGoal("ses_foreign"))?.status).toBe("active")
+  expect(await getGoal("ses_paused")).toMatchObject({ status: "paused", stopReason: "paused" })
+  expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 disposal cancels event-stream backoff without pausing a goal", async () => {
+  await createGoal("ses_v2", "dispose during reconnect", { agent: "build" })
+  const mock = makeMockContext()
+  let attempts = 0
+  mock.event.subscribe = () => { attempts++; throw new Error("temporary outage") }
+  const cleanup = await setupPlugin(mock as never)
+  await waitFor(async () => Boolean((await getGoal("ses_v2"))?.lastStatus?.includes("reconnecting")))
+  await cleanup()
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  expect(attempts).toBe(1)
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
 
 test("V2 a command transport abort preserves the active goal for reconnection", async () => {

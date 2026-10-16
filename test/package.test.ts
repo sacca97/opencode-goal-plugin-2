@@ -21,7 +21,7 @@ test("published tui entrypoint shares host runtime instances via peerDependencie
   }
 })
 
-test("engines.opencode covers the V2 beta line and the V1 floor while excluding older stable releases", () => {
+test("engines.opencode requires OpenCode V2", () => {
   const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
     engines?: Record<string, string>
   }
@@ -29,12 +29,11 @@ test("engines.opencode covers the V2 beta line and the V1 floor while excluding 
   expect(range).toBeString()
   if (typeof range !== "string") throw new Error("expected engines.opencode to be a string range")
 
-  // The range must cover the 0.0.0-beta-* V2 line and the V1 floor 1.17.1
-  // while excluding unsupported stable pre-1.17.1 releases.
-  for (const version of ["0.0.0-beta-0", "0.0.0-beta-19425", "1.17.1", "1.17.2", "2.0.0"]) {
+  // This fork supports the stable V2 contract only.
+  for (const version of ["2.0.0", "2.0.26"]) {
     expect(satisfies(version, range)).toBe(true)
   }
-  for (const version of ["0.0.0", "0.0.1", "0.5.0", "1.0.0", "1.17.0"]) {
+  for (const version of ["0.0.0-beta-19425", "0.0.0", "1.17.1", "1.18.32"]) {
     expect(satisfies(version, range)).toBe(false)
   }
 })

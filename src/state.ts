@@ -5,6 +5,7 @@ import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
 import { statePath } from "./state-path"
+import { withStateLock } from "./state-lock"
 import {
   applyGoalPlanOps,
   GoalPlanSchema,
@@ -359,41 +360,6 @@ function mutableState(state: Schema.Schema.Type<typeof PersistedStateSchema>): S
 }
 
 const warnedEmptyStatePaths = new Set<string>()
-export type StateRecoveryNotice = {
-  stateFile: string
-  quarantineFile: string
-  outcome: "quarantined" | "quarantineFailed" | "sourceChanged"
-  error?: string
-}
-type StateRecoveryListener = {
-  stateFile: string
-  report: (notice: StateRecoveryNotice) => Promise<void> | void
-}
-const stateRecoveryListeners = new Set<StateRecoveryListener>()
-
-export function onStateRecovery(stateFile: string, report: StateRecoveryListener["report"]) {
-  const listener = { stateFile, report }
-  stateRecoveryListeners.add(listener)
-  return () => stateRecoveryListeners.delete(listener)
-}
-
-function notifyStateRecovery(notice: StateRecoveryNotice) {
-  for (const listener of stateRecoveryListeners) {
-    if (listener.stateFile !== notice.stateFile) continue
-    void Promise.resolve()
-      .then(() => listener.report(notice))
-      .catch((error) => {
-        try {
-          console.error(
-            `[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`,
-            error instanceof Error ? error.message : String(error),
-          )
-        } catch {
-          // Reporting must never block state recovery.
-        }
-      })
-  }
-}
 
 function isStatePadding(character: string) {
   return character === "\0" || character.trim() === ""
@@ -436,11 +402,15 @@ function readStateResultEffect(file = statePath()) {
       }),
     ),
     Effect.flatMap(({ value, recoveryContent }) =>
-      decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent }))),
+      decodeState(value).pipe(Effect.map((state) => ({
+        state,
+        recoveryContent,
+        normalized: JSON.stringify(value) !== JSON.stringify(state),
+      }))),
     ),
     Effect.catchAll((error) =>
       error._tag === "StateReadError" && isMissingStateFile(error.cause)
-        ? Effect.succeed({ state: emptyState(), recoveryContent: null })
+        ? Effect.succeed({ state: emptyState(), recoveryContent: null, normalized: false })
         : Effect.fail(error),
     ),
   )
@@ -532,9 +502,10 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
   return enqueueMutation(() => {
     const file = statePath()
-    return Effect.runPromise(
+    return withStateLock(file, () => Effect.runPromise(
       Effect.gen(function* () {
-        const { state, recoveryContent } = yield* readStateResultEffect(file)
+        const { state, recoveryContent, normalized } = yield* readStateResultEffect(file)
+        const before = JSON.stringify(state)
         const result = yield* Effect.tryPromise({
           try: () => Promise.resolve(fn(state)),
           catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
@@ -542,12 +513,6 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
         if (recoveryContent != null) {
           const quarantine = yield* quarantineStateEffect(file, recoveryContent)
           if (quarantine.error != null) {
-            const notice: StateRecoveryNotice = {
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "quarantineFailed",
-              error: quarantine.error,
-            }
             try {
               console.error(
                 `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
@@ -556,17 +521,10 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             } catch {
               // Diagnostics must never block state recovery.
             }
-            notifyStateRecovery(notice)
           } else {
             const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
             if (!unchanged) {
               const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
-              notifyStateRecovery({
-                stateFile: file,
-                quarantineFile: quarantine.quarantineFile,
-                outcome: "sourceChanged",
-                error: message,
-              })
               return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }))
             }
             try {
@@ -576,17 +534,12 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             } catch {
               // Diagnostics must never block state recovery.
             }
-            notifyStateRecovery({
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "quarantined",
-            })
           }
         }
-        yield* writeStateEffect(state, file)
+        if (normalized || recoveryContent != null || JSON.stringify(state) !== before) yield* writeStateEffect(state, file)
         return result
       }),
-    )
+    ))
   })
 }
 
@@ -1069,6 +1022,27 @@ export async function pauseGoalForPlanMode(sessionID: string) {
   })
 }
 
+export async function recordGoalRuntimeFailure(sessionID: string, goalID: string, detail: string, pause: boolean) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    // An outage must not overwrite a replacement goal or a user's stop/pause.
+    if (!goal || goal.id !== goalID || goal.status !== "active") return null
+    goal.lastStatus = detail
+    goal.updatedAt = nowSeconds()
+    if (pause) {
+      accountWallClock(goal)
+      goal.status = "paused"
+      goal.lastAccountedAt = null
+      goal.stopReason = "event stream unavailable"
+      goal.blocker = detail
+      goal.pendingAttempt = null
+      goal.awaitingContinuationProgress = false
+    }
+    pushHistory(goal, pause ? "error" : "warning", detail)
+    return snapshot(goal)
+  })
+}
+
 export async function setGoalStatus(
   sessionID: string,
   status: MutableGoalStatus,
@@ -1403,19 +1377,23 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
  * (the attempt is a reserved turn); if the attempt is later canceled before it
  * is actually sent, callers must roll it back with rollbackContinuationAttempt.
  */
-export async function reserveContinuation(sessionID: string, maxAutoTurns: number, minIntervalSeconds: number) {
+export async function reserveContinuation(sessionID: string, maxAutoTurns: number, minIntervalSeconds: number, options?: { untracked?: boolean }) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
+    // Check before limits too: another server must not send a wrap-up while
+    // the first server is still delivering the last allowed turn.
+    if (goal.pendingAttempt) return null
+    if (options?.untracked && goal.status !== "active") return null
     if (goal.status === "budgetLimited" || goal.status === "usageLimited") return reserveWrapup(goal)
     if (!canContinue(goal.status)) return null
     const now = nowSeconds()
     accountWallClock(goal, now)
-    if (maybeStopForUsageLimit(goal, maxAutoTurns, now)) return reserveWrapup(goal)
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
-    goal.autoTurns += 1
+    if (!options?.untracked && maybeStopForUsageLimit(goal, maxAutoTurns, now)) return reserveWrapup(goal)
+    if (!options?.untracked && goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds) return null
+    if (!options?.untracked) goal.autoTurns += 1
     const previousLastContinuationAt = goal.lastContinuationAt
-    goal.lastContinuationAt = now
+    if (!options?.untracked) goal.lastContinuationAt = now
     // The baseline is captured at reservation time, but the no-progress
     // evaluation is only armed once recordContinuationResult confirms the
     // continuation prompt was actually delivered.
@@ -1426,12 +1404,12 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
       reservedAt: Date.now(),
       started: false,
       delivered: false,
-      committed: true,
-      armNoProgress: true,
+      committed: !options?.untracked,
+      armNoProgress: !options?.untracked,
       previousLastContinuationAt,
     }
     goal.awaitingContinuationProgress = false
-    goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`
+    goal.lastStatus = options?.untracked ? "Turn watchdog retry reserved." : `Auto-continue ${goal.autoTurns} reserved.`
     pushHistory(goal, "autoContinue", goal.lastStatus)
     goal.updatedAt = now
     return snapshotInternal(goal)
@@ -1485,7 +1463,8 @@ export async function recordContinuationResult(
     const goal = state.goals[sessionID]
     if (!goal || isClosed(goal.status)) return goal ? snapshotInternal(goal) : null
     if (options?.expectedGoalID && goal.id !== options.expectedGoalID) return null
-    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) return null
+    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID &&
+      !(result === "success" && goal.pendingAttempt == null)) return null
     const now = nowSeconds()
     goal.updatedAt = now
     if (result === "success") {
@@ -1678,10 +1657,6 @@ function goalLimitSummary(goal: Goal) {
   return limits.length ? `Goal set with ${limits.join(", ")}.` : "Goal set with default continuation limits."
 }
 
-export function estimateTokensFromText(text: string) {
-  return Math.ceil(text.length / 4)
-}
-
 export function formatGoal(goal: GoalSnapshot | null) {
   if (!goal) return "No goal is set for this session."
   const lines = [
@@ -1700,10 +1675,4 @@ export function formatGoal(goal: GoalSnapshot | null) {
   if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
   if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
   return lines.join("\n")
-}
-
-export function formatGoalHistory(goal: GoalSnapshot | null) {
-  if (!goal) return "No goal history is available for this session."
-  if (goal.history.length === 0) return "No goal history recorded yet."
-  return goal.history.map((entry) => `- [${new Date(entry.timestamp * 1000).toISOString()}] ${entry.type}: ${entry.detail}`).join("\n")
 }

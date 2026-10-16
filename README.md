@@ -1,359 +1,64 @@
-# OpenCode Goal Plugin
+# OpenCode Goal Plugin — V2 fork
 
-[![npm version](https://img.shields.io/npm/v/@prevalentware/opencode-goal-plugin.svg)](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-[![GitHub repository](https://img.shields.io/badge/GitHub-prevalentWare%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/prevalentWare/opencode-goal-plugin)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+This checkout targets OpenCode 2.x. It has not been installed into the user's OpenCode configuration.
 
-OpenCode Goal Plugin adds Codex-style long-running goal mode to OpenCode. It gives AI coding agents a `/goal` slash command, persistent goal state, completion evidence, idle continuation, and a terminal UI goal indicator so an OpenCode session can keep working toward one explicit objective until it is complete, blocked, or cleared.
+Goal Mode records one objective per session and continues after successful executions until the goal is completed, blocked, cancelled, paused, or limited. Cancellation, Plan-mode restrictions, task deferral, and duplicate-delivery protection remain enforced.
 
-If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a way to keep an OpenCode AI coding agent focused on a long-running task, this package is the npm plugin for that workflow.
+## Changes in this fork
 
-Links:
+- Removed the V1 server and TUI adapters and their obsolete tests.
+- Removed the runtime dependency on `@opencode-ai/plugin`.
+- `get_goal` defaults to a compact summary. Use `{ "view": "full" }` for the full plan and history.
+- Plan updates default to compact responses; `response_mode: "full"` opts into full output.
+- Plans are optional. Existing plans retain revision checks, evidence requirements, and incremental `plan_ops`.
+- Sessions without goals receive no Goal Mode system policy.
+- Unchanged mutations skip atomic disk replacement and fsync. Schema migrations, normalized data, and corrupt-state recovery still persist.
+- The V2 palette reads persisted state so compact tool output does not hide the current goal.
+- Local directory entrypoints and the native smoke harness work with V2 loading.
+- Pause, resume, status, history, stop, clear and edit execute in the command handler before the model acknowledges the result. Resume then starts goal work. Editing leaves the revised goal paused until explicitly resumed.
+- Ordinary messages steer work while the goal stays active. They invalidate stale continuation preparation; continuation resumes after the human-directed turn. Use pause or stop explicitly to halt the goal.
+- Removed the duplicate `set_goal` tool; use `create_goal`.
+- Dropped event streams reconnect up to three times, after 250 ms, 1 s and 2 s. Continuations wait during the outage; recovery checks the live runner before restarting. Retry progress and the last failure are recorded in goal status/history. Exhausted retries pause owned active goals with a visible cause and instructions to reload the plugin and resume. A connection must process events for at least 30 seconds before its retry allowance resets, so a flapping stream cannot retry forever. Unloading cancels the backoff.
 
-- npm package: [`@prevalentware/opencode-goal-plugin`](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-- GitHub repository: [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)
-- OpenCode 1 global install: `opencode plugin -g @prevalentware/opencode-goal-plugin`
+The Promise-based state API and version 3 state format remain compatible. Effect stays at the persistence boundary; Zod validates tool input. Budget accounting and lifecycle guards are retained rather than replaced with unverified timing assumptions.
 
-The OpenCode Goal Plugin adds:
+## Commands and tools
 
-- `/goal <objective>`, `/pause_goal`, and `/resume_goal` as OpenCode commands for TUI, desktop, web, and remote integrations that expose the server command catalog.
-- A sidebar goal indicator with status, elapsed time, and objective.
-- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_status`, `update_goal`, `stop_goal`, `replace_goal`, `update_goal_plan`, and `clear_goal`.
-- Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
-- Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
-- Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
-- Plan-mode safety: goals created from the `plan` agent stay paused, and auto-continue never escapes a Plan-mode session or switches agents on its own.
-- Compaction context so active goals are preserved when OpenCode summarizes a long session.
+Use `/goal <objective>` to start, `/goal` for status, and `/pause_goal` or `/resume_goal` for control. The main command also supports `history`, `edit <objective>`, `stop`, `clear`, and `replace <objective>`.
 
-## Why Use This OpenCode Goal Plugin?
+The agent can create/read/update goals through the existing goal tools. `update_goal` accepts `status: "complete"` with evidence or `status: "unmet"` with a blocker. Plans, when used, can be updated incrementally with `update_goal_plan` and `plan_ops`, avoiding resending task descriptions for status changes.
 
-Use this plugin when you want OpenCode to behave more like a goal-driven coding agent instead of a one-prompt assistant. A goal stays visible, survives session compaction, can continue automatically when the session becomes idle, and can only be closed with explicit evidence or a concrete blocker.
-
-Common use cases:
-
-- Keep an OpenCode agent focused during long refactors, migrations, reviews, or test-fixing sessions.
-- Track one explicit objective across TUI, desktop, and web OpenCode surfaces.
-- Require completion evidence before a goal is marked done.
-- Preserve the current goal when OpenCode summarizes or compacts a long conversation.
-
-## Install
-
-Choose the instructions that match the CLI you run:
-
-| OpenCode version | How to identify it | Instructions |
-| --- | --- | --- |
-| OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
-| OpenCode 2 beta | You run `opencode2` | [OpenCode 2](#opencode-2-beta) |
-
-Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `cli.json`.
-
-### OpenCode 1 Stable
-
-For goal mode across your projects, install globally:
-
-```bash
-opencode plugin -g @prevalentware/opencode-goal-plugin
-```
-
-The global install registers the plugin in your user configuration and avoids creating a project-local `.opencode/`
-directory for its dependencies.
-
-If you want the plugin only in the current project, install it from that project's directory instead:
-
-```bash
-opencode plugin @prevalentware/opencode-goal-plugin
-```
-
-The project install can create `.opencode/` with plugin dependencies in your workspace. OpenCode detects both package
-entrypoints and writes the plugin into the corresponding server and TUI config targets.
-
-For manual installation, add the package to both V1 config files.
-
-`opencode.json`:
-
-```json
-{
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
-}
-```
-
-`tui.json`:
-
-```json
-{
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
-}
-```
-
-### OpenCode 2 Beta
-
-Use this section only when running `opencode2`. Plugin releases from the `feat/v2-adaptation` line support OpenCode 2 beta `0.0.0-beta-19425` (the current `@opencode/cli@beta` / `@opencode/plugin@beta` contract) while remaining compatible with OpenCode 1.
-
-Add the package to both V2 plugin lists:
-
-`opencode.json`:
-
-```json
-{
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
-}
-```
-
-`~/.config/opencode/cli.json`:
-
-```json
-{
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
-}
-```
-
-OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint comes from `opencode.json`, while the sidebar and palette integration come from `~/.config/opencode/cli.json`.
-
-OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the beta version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, TUI sidebar/palette integration, goal compaction context, and transcript-based task recovery. Goal compaction context is injected through the V2 `session.compaction` hook on hosts that provide it (newer than beta-19425); on older betas the registration degrades to a no-op. After a plugin or server restart, V2 rebuilds Task-subagent deferral state by replaying each non-closed goal session's persisted transcript, because the V2 plugin context exposes no live child-session query; children that leave no finalized tool entry in the transcript are only observed through live events.
-
-## Options
-
-In OpenCode 1, server options use the package-and-options tuple in `opencode.json`:
-
-```json
-{
-  "plugin": [
-    [
-      "@prevalentware/opencode-goal-plugin",
-      {
-        "auto_continue": true,
-        "defer_while_tasks_active": true,
-        "max_auto_turns": 25,
-        "min_continue_interval_seconds": 3,
-        "max_turn_time": 300,
-        "max_task_block_seconds": 900,
-        "max_prompt_failures": 3,
-        "locale": "zh-CN",
-        "default_token_budget": 200000,
-        "max_goal_duration_seconds": 1800,
-        "no_progress_token_threshold": 50,
-        "max_no_progress_turns": 2,
-        "restricted_agents": ["plan"],
-        "allow_goal_execution_from_plan": false,
-        "max_objective_chars": 100000
-      }
-    ]
-  ]
-}
-```
-
-In OpenCode 2, use the plugin object form instead:
-
-```json
-{
-  "plugins": [
-    {
-      "package": "@prevalentware/opencode-goal-plugin",
-      "options": {
-        "auto_continue": true,
-        "max_auto_turns": 25,
-        "locale": "zh-CN",
-        "default_token_budget": 200000,
-        "restricted_agents": ["plan"]
-      }
-    }
-  ]
-}
-```
-
-For OpenCode 1, server and TUI plugins are configured separately. To force the TUI to the same locale, use the same
-option in `tui.json`:
-
-```json
-{
-  "plugin": [
-    [
-      "@prevalentware/opencode-goal-plugin",
-      {
-        "locale": "zh-CN"
-      }
-    ]
-  ]
-}
-```
-
-Defaults:
-
-- `auto_continue`: `true`
-- `defer_while_tasks_active`: `true`; when enabled, goal auto-continuation waits for active OpenCode Task child sessions and their orchestrator reconciliation before sending the next goal prompt. A deferral re-checks child sessions on a short timer, so a goal deferred by a task never depends on a further idle event to resume.
-- `max_task_block_seconds`: `900`; wall-clock ceiling on how long a single Task child session may defer goal continuation. A child that stays listed but never reports a terminal state, or a terminal child whose result is never reconciled, stops blocking once the ceiling passes. Set a smaller value for shorter subagents, `0` to remove the ceiling, or disable deferral entirely with `defer_while_tasks_active: false`.
-- `max_auto_turns`: `25`; explicitly resuming a goal with `/goal resume` or `/resume_goal` after it reaches this limit starts a fresh auto-turn window. Token usage and elapsed-time usage are preserved.
-- `min_continue_interval_seconds`: `3`
-- Fast V2 executions that finish inside this interval schedule a delayed continuation; they do not require another user message to wake up.
-- `max_turn_time`: unset by default; set a positive number of seconds to retry one active-goal continuation prompt when a model turn remains busy for that long. Each new busy event resets the watchdog. Idle, built-in retry, session deletion, active Task children, and restricted agents suppress the retry. Watchdog retries are independent of `min_continue_interval_seconds` and never consume auto-turn or no-progress budgets, but recognized transport failures still count toward the `max_prompt_failures` ceiling.
-- `max_prompt_failures`: `3`; consecutive transport or no-response continuation failures pause the goal at this ceiling. Prompt delivery alone does not reset the count; substantive assistant or tool progress, a new goal, or an explicit resume does.
-- `default_token_budget`: unset by default; when set, new goals inherit this token budget.
-- `max_goal_duration_seconds`: unset by default; when set, new goals inherit this elapsed-time safety limit.
-- `no_progress_token_threshold`: `50`; output-token floor used to judge whether a goal continuation turn made progress.
-- `max_no_progress_turns`: `2`; consecutive low-progress goal continuation turns before pausing. Only turns produced by a reserved goal continuation count — ordinary low-output assistant messages (for example short tool-call-only turns from PTY or status checks) never increment this counter.
-- `locale`: `"en"` by default. Set `"zh-CN"` for Simplified Chinese, or `"auto"` to detect `LC_ALL`, then `LANG`, then
-  the OS/JavaScript runtime locale. Unsupported explicit locales fall back to English.
-- `register_command`: `true`; registers `/goal`, `/pause_goal`, and `/resume_goal`.
-- `command_name`: `"goal"`; renames the main goal command only. The reserved names `pause_goal` and `resume_goal` fall back to `goal` so the standalone controls remain available.
-- `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
-- `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
-- `max_objective_chars`: `100000`; maximum Unicode code-point length of the submitted goal objective, completion evidence,
-  and blocker text. The previous 4000-character cap was a defect, not a compatibility constraint. The same limit is
-  advertised on V1 and V2 tool schemas and enforced at runtime, independently per plugin instance. Accepted values are
-  trimmed before persistence. Large objectives are echoed into continuation and compaction prompts.
-
-## Goal Workflow
-
-Use `/goal <objective>` in a fresh OpenCode chat to create a long-running goal:
-
-```text
-/goal review the frontend and translate visible English UI text to Spanish
-```
-
-Bare `/goal` reports the current goal state. `/goal history` reports the current and archived goal lifecycle history. `/goal edit <objective>` updates the current objective. `/goal pause` pauses the goal without closing it, and `/goal resume` resumes it. The standalone `/pause_goal` and `/resume_goal` controls are discoverable by remote integrations that expose OpenCode's server command catalog. Their arguments and resolved attachments are removed before composing the goal-control prompt, although OpenCode V1 may evaluate its own command syntax before plugin hooks run. `/pause_goal` persists the pause before its acknowledgement turn starts, preventing a later idle event from starting another continuation. It cannot cancel a continuation that was already delivered or whose delivery was already in flight when the pause was committed. Pausing a goal that is already `budgetLimited` or `usageLimited` preserves that safety status; resuming a closed `complete`, `unmet`, or `cancelled` goal is rejected. `/goal stop` and `/goal cancel` persist a terminal `cancelled` state and prevent further autonomous continuation. `/goal clear` archives and detaches the current goal without deleting its history; `/goal off`, `/goal reset`, and `/goal none` are clear aliases. `/goal replace <objective>` atomically cancels and archives the current goal before starting an independent replacement in the same thread. A plain `/goal <objective>` can also start a new goal after the previous one is closed or cleared. The TUI also includes a `Goal` command-palette entry for viewing, refreshing, pausing, resuming, showing history, or clearing the current goal state.
-
-You can also ask the agent to formulate the objective and call `set_goal` itself, for example: "set your own goal to finish this refactor safely." The tool uses the agent-written objective but still only creates a goal when explicitly requested.
-
-When writing the objective, include the scope, non-goals, and verification path when they matter. The agent is reminded to audit real files, command output, tests, or PR state before closing the goal.
-
-The `update_goal` tool can close a goal in two ways:
-
-- `status: "complete"` with `evidence` when every requirement is actually achieved.
-- `status: "unmet"` with `blocker` when the objective cannot be achieved or is blocked by missing external input.
-
-The plugin also uses safety states while keeping the goal available for review or resume:
-
-- `budgetLimited` when a token budget is exhausted.
-- `usageLimited` when an auto-turn or elapsed-time budget is exhausted.
-- `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-progress goal continuation turns are detected. No-progress accounting is scoped to goal continuation turns: each reserved continuation is evaluated once, when its turn completes, and unrelated assistant activity in the session never pauses the goal.
-
-When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
-
-## Plan Mode Safety
-
-OpenCode Plan mode is a user-controlled safety boundary, and goal mode must not become an escape hatch out of it. The plugin enforces that boundary in several layers:
-
-- Goals created with `create_goal` or `set_goal` from the `plan` agent are recorded as `paused` with stop reason `plan mode`, never as active implementation goals. The tool response tells the agent to ask the user to switch to Build mode and resume the goal.
-- Automatic idle continuation is suppressed while the last user prompt or the latest assistant turn came from a restricted agent. If a previously active goal idles under Plan mode, it is paused visibly instead of continuing autonomously.
-- Resuming a goal (`update_goal_status` with `active`, or `update_goal_objective` with `status: "active"`) is refused from Plan mode, so a prompt-injected instruction inside repository content cannot self-escalate a planning session into Build-mode execution. Switching to Build mode and resuming is an explicit user action; resuming from Build updates the tracked agent so continuation restarts pinned to Build.
-- Continuation prompts are pinned to the agent recorded from the last user prompt (`body.agent`), so auto-continue never silently switches the session to a different agent or mode.
-- Every session receives the same compact Goal Mode system policy, regardless of whether a goal exists or which lifecycle state it is in. Dynamic objectives, limits, counters, and stop details stay in goal-tool results, continuation prompts, and compaction context; Plan-mode and safety-limit enforcement remains server-side.
-
-The set of planning-only agents is configurable with `restricted_agents` (default `["plan"]`). Setting `allow_goal_execution_from_plan` to `true` opts out of all of these restrictions; the secure default is `false`.
+Defaults: automatic continuation enabled, 25 continuation turns, a three-second minimum interval, task deferral enabled, and Plan-mode execution disabled. Token and elapsed-time budgets are optional. Goal control does not bypass OpenCode permissions.
 
 ## State
 
-Goal state is stored at:
+State lives at `$XDG_DATA_HOME/opencode-goal-plugin/goals.json`, defaulting to `~/.local/share/opencode-goal-plugin/goals.json`. Set `OPENCODE_GOAL_STATE_PATH` for an isolated file.
 
-```text
-$XDG_DATA_HOME/opencode-goal-plugin/goals.json
-```
+Writes use a same-directory temporary file and atomic rename with owner-only permissions. Existing version 1 and 2 files migrate on mutation. Invalid state is not silently overwritten; recoverable padding is quarantined.
 
-If `XDG_DATA_HOME` is not set, the default is:
+The mutation queue serializes writers within one process. A companion `goals.json.lock.sqlite` file uses Bun's built-in SQLite writer lock to serialize complete read-modify-write operations across processes. It stores no goal data. The OS releases the lock when a writer exits or crashes; no stale PID files or timeout-based lock stealing are needed. Lock acquisition yields between retries and fails after ten seconds rather than overwriting unlocked state. All writers must use this fork; older plugins do not honor its lock.
 
-```text
-~/.local/share/opencode-goal-plugin/goals.json
-```
+## Development and verification
 
-Set `OPENCODE_GOAL_STATE_PATH` to use a custom file.
-
-The state file is written atomically through a same-directory temp file: the final path is only ever replaced by a fully-flushed file, so after a crash the state is the previous or the new valid version, never a torn one. The file is created with owner-only permissions where the host filesystem supports them, and the temp name is a random UUID opened exclusively so concurrent writers cannot collide.
-
-Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden power loss on macOS/APFS is not an absolute durability guarantee; where the platform cannot fsync the parent directory, a crash may leave the old or the new state file (both valid), never a partially-written one. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata. Cleared and replaced goals remain in bounded per-session history so a thread can host multiple goals over time without losing the prior lifecycle record.
-
-The plugin migrates version 1 and 2 state files to version 3 on the next write. Version 2 introduced stable goal identities, the terminal `cancelled` status, and compact archives. Older plugin versions intentionally reject version 2 instead of silently dropping archived history on their next write; back up or isolate `OPENCODE_GOAL_STATE_PATH` before downgrading.
-
-Version 3 adds persistent goal plans and revision metadata. Version 1 and 2 files migrate on the next write, and the sidebar accepts all three versions. Planless version 3 state remains compatible with the preceding release; populated plans and nonzero revisions require this planning release. Back up or isolate `OPENCODE_GOAL_STATE_PATH` before downgrading.
-
-If the rename succeeds but syncing the parent directory reports a genuine I/O error, the mutation reports a write failure even though the new valid state may already be present. This avoids claiming durability that the filesystem did not confirm.
-
-If a non-empty state file contains only whitespace, a UTF-8 BOM, or NUL bytes after an interrupted write, the next mutation preserves its exact contents beside the state file as `goals.json.corrupt-<timestamp>-<uuid>` before writing recovered state. If another process replaces the state during recovery, the mutation refuses to overwrite that newer content. If the quarantine copy itself cannot be created, the plugin reports the failure and continues recovery rather than making every prompt fail indefinitely. OpenCode 1 also records the quarantine outcome and path through its application log so the data-loss event remains discoverable.
-
-## Credits
-
-This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from William Ricchiuti's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, William.
-
-## Development
-
-```bash
-bun install
-bun run test
+```sh
+bun install --frozen-lockfile
 bun run lint
 bun run typecheck
+bun test
 bun run build
-npm pack --dry-run
+bun run pack:dry-run
+OPENCODE_V2_BIN=/path/to/opencode bun run smoke:v2
+GOAL_TWO_SERVERS=1 OPENCODE_V2_BIN=/path/to/opencode bun run smoke:v2
+GOAL_TWO_SERVERS=1 GOAL_BACKGROUND_SHELL=1 OPENCODE_V2_BIN=/path/to/opencode bun run smoke:v2
 ```
 
-With `opencode2` installed, run `bun run build && bun run smoke:v2` to exercise the
-native V2 lifecycle, not just mocked events. The smoke test uses a private server,
-isolated home/config/database/goal state, and a deterministic local model with no
-real provider credentials. It invokes `/goal`, requires **two** automatic
-continuations with the default minimum interval, then verifies completion. A
-second loaded location checks that server-wide events do not duplicate delivery.
-The test prints its temporary artifact directory and shuts down its private
-server. Use `OPENCODE_V2_BIN` to select another V2 binary, or run
-`bun run smoke:v2 @prevalentware/opencode-goal-plugin@<version>` to install and
-verify an exact published package in the isolated environment.
+Development dependencies are installed only in this checkout. The default smoke test loads this checkout into a temporary V2 server with an isolated home, config, database and goal state, using a deterministic loopback model. It does not install or register this fork in the user's OpenCode setup. It verifies two automatic continuations, direct pause/status/resume, ordinary human steering, and completion, with a second location loaded to catch duplicate delivery. Process tests verify concurrent state writers and lock release after a forced process kill.
 
-## Publishing
+The two-server variant runs concurrent goals through separate native server processes sharing the same private database and goal file. Reservation race tests additionally send the same idle boundary to two plugin instances and race two processes for the same goal. Normal continuation and optional watchdog retries both reserve atomically.
 
-This package is set up for npm Trusted Publishing from GitHub Actions. On every push to `main`, CI runs typecheck, lint, and unit tests in parallel. If they all pass, the publish job computes the next patch version from the latest version on npm, builds the package, and runs `npm publish`.
+Running tool calls and host transcript shells defer continuation even after an execution ends. These waits leave the goal active, consume no auto-turns, and suppress watchdog retries; continuation rechecks after completion. This safety check is independent of the optional child-task deferral setting.
+The background-shell smoke variant verifies this with a real three-second background process, not just simulated tool hooks.
 
-Before the first automated publish, configure the package on npm:
+For a future manual activation, the V2 server and CLI each accept a `plugins` entry pointing to this repository directory. Build first. No activation has been performed here.
 
-1. Open the package settings on npmjs.com.
-2. Add a Trusted Publisher for GitHub Actions.
-3. Use repository `prevalentWare/opencode-goal-plugin`.
-4. Use workflow file `publish.yml`.
-
-The repository must be public for npm provenance to be generated automatically.
-
-## Notes
-
-OpenCode plugin modules are target-specific. This package exports separate modules for server hooks/tools and TUI UI:
-
-```json
-{
-  "exports": {
-    "./server": "./dist/server.js",
-    "./tui": "./src/tui.ts"
-  }
-}
-```
-
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by V2 `session.execution.succeeded` events and legacy `session.idle` / `session.status` idle notifications, never by intermediate model-step completion. V2 execution starts arm busy tracking; native `session.retry.scheduled` events cancel plugin recovery while OpenCode retries. Terminal execution transport failures use bounded recovery. A V2 `session.execution.interrupted` event with reason `user`, or a V1 session/assistant `MessageAbortedError`, persists a terminal `cancelled` state for an active goal and invalidates timers and outstanding continuation preparation without charging a prompt failure. A later idle, unrelated prompt, or plugin reload cannot resume that goal; start an explicitly requested new goal with `/goal <objective>` or `/goal replace <objective>`. Cancelling a manual turn preserves paused or limited goals. V2 shutdown, superseded, and other interruptions only suppress local continuation until the host starts another execution; they do not cancel the persisted goal. V1 exposes only `MessageAbortedError`, so it cannot distinguish user cancellation from other host aborts of an active goal. Use `/pause_goal` for a durable, resumable pause. Each V2 plugin instance handles goal events only for its own location while still observing cross-location child task lifecycles. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn or no-progress budgets; recognized transport failures do count toward the prompt-failure ceiling. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn, bounded by the `max_task_block_seconds` ceiling so an unobservable child cannot stall a goal indefinitely. During compaction on OpenCode 1, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative; on OpenCode 2, compaction runs inside the session's execution flow, so the plugin instead injects the goal snapshot through the `session.compaction` hook where the host provides it.
-
-The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. It checks the shared goal state file every second so usage and checkpoints stay current during a long run. Closed goals remain visible briefly through the latest tool state as achieved or unmet.
-
-
-### Zed and ACP lifecycle boundaries
-
-Cancelling an active goal from an ACP client is durable when OpenCode emits the user-cancellation events described above. The plugin prevents subsequent goal continuations, including callbacks still preparing a prompt when cancellation arrives. OpenCode owns cancellation of in-flight model requests, tools, subprocesses, and already submitted prompts; the plugin cannot guarantee process termination if the host does not abort them or does not publish a cancellation signal. It does not interpret ordinary idle events, provider-error text, or completed tool calls as user cancellation.
-
-Registered `/goal <objective>` and `/resume_goal` commands use the host's public session-wait API to remain pending across automatic continuations until the goal stops, completes, reaches a safety limit, or auto-continuation is disabled. Hosts without that API keep their previous admission behavior. The ACP adapter must also stream each execution owned by the command: an adapter that ends its event consumer after the first execution can still hide later work. The [OpenCode command-lifetime integration](https://github.com/anomalyco/opencode/pull/53913) fixes that adapter behavior and supplies explicit interruption hooks. Ordinary prompts retain their host-defined turn lifetime.
-
-### Persistent plans and ACP
-
-For multi-phase goals, `update_goal_plan` saves overall criteria, phases, tasks, decisions, verification evidence,
-and a bounded revision history. Create a plan with `goal_id`, `expected_revision`, the full `plan`, and a `reason`.
-For routine edits, send `plan_ops` instead of `plan`: `set_phase` changes status, verification, or blocker;
-`set_task` changes status, evidence, or blocker; `append_decision` records a decision. Operations in one call are
-validated and committed together. Use the current `planRevision` as `expected_revision`; concurrent or delayed
-updates to a replaced or edited goal are rejected.
-
-`get_goal` accepts `view: "summary"` for a small status, revision, and progress response; omit it or use `"full"`
-to retrieve the complete plan. `update_goal_plan` accepts `response_mode: "summary"` and defaults to a summary
-for `plan_ops`; full-plan calls retain the complete response by default. The continuation prompt includes the goal
-ID, revision, completion criteria, progress, and current work. `get_goal` and compaction retain the full plan.
-Summary views also include up to three blocked tasks in the current phase, their blockers, and the total blocked count.
-Completion criteria cannot change; blocked work needs a blocker, completed tasks need evidence, and completed
-phases need verification. Changing planned scope or reopening verified work requires concrete `revisit_evidence`;
-validation errors include field paths and report all detected violations in one response.
-
-Marking a task completed requires evidence; completing a phase requires all its tasks and phase verification. Start the next phase only after verifying the current phase. Completed work cannot be removed, and reopening it requires `revisit_evidence`. Removing or changing pending scope also requires concrete `revisit_evidence`, recorded with the revision. Overall completion criteria stay fixed until the user explicitly changes the goal's objective with `/goal edit <objective>` or replaces the goal. A goal with an unfinished plan cannot be marked complete. Explicit objective edits clear the old plan and increment its revision. Existing state files migrate automatically; plan data survives compaction and is retained in goal history.
-
-Goal tools publish standard ACP plan entries in `metadata.acp.plan`, with richer goal state in its `_meta` field. An ACP host that projects this metadata can display task progress and replay it when reloading a conversation. This requires the [OpenCode ACP plan projection](https://github.com/anomalyco/opencode/pull/53929); a plugin update alone cannot change an older adapter's UI. Finishing a task or phase leaves the overall goal active.
-
-The Promise-based persistence layer uses Effect 3 under the private `effect-goal-state` npm alias. This keeps it separate from modern OpenCode's shared Effect 4 SDK runtime. It remains an external runtime dependency, and no private Effect values cross the plugin API.
-
-ACP permits one pending prompt per session. While a goal command is open, use Cancel to interrupt it; `/pause_goal` cannot be submitted as a second ACP prompt until that request ends.
+Original project: [prevalentWare/opencode-goal-plugin](https://github.com/prevalentWare/opencode-goal-plugin). MIT license.
