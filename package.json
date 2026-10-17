@@ -41,6 +41,7 @@
     "server.js",
     "tui.ts",
     "src/tui.ts",
+    "src/command-name.ts",
     "src/i18n.ts",
     "src/state-path.ts",
     "LICENSE",
@@ -48,7 +49,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun build ./src/server.ts --outdir ./dist --target bun --external effect-goal-state --external zod",
+    "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external effect-goal-state --external zod",
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",

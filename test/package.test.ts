@@ -37,3 +37,10 @@ test("engines.opencode requires OpenCode V2", () => {
     expect(satisfies(version, range)).toBe(false)
   }
 })
+
+test("TUI and server resolve the same command name", async () => {
+  const { resolveCommandName } = await import("../src/command-name")
+  expect(resolveCommandName(undefined)).toBe("goal")
+  expect(resolveCommandName("  work ")).toBe("work")
+  for (const invalid of ["pause_goal", "Resume_Goal", "has space", "-bad", 42]) expect(resolveCommandName(invalid)).toBe("goal")
+})

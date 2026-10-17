@@ -1122,3 +1122,18 @@ test("delayed prior-turn assistant output cannot clear a newer pending attempt",
   })
   expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
 })
+
+test("a watchdog may take over a started attempt only after it has hung", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 5, { started: true })
+
+  // A fresh attempt (or no takeover window) still blocks, so racing watchdogs reserve one rescue.
+  expect(await reserveContinuation("ses_1", 10, 0, { untracked: true })).toBeNull()
+  expect(await reserveContinuation("ses_1", 10, 0, { untracked: true, takeOverStartedAfterMs: 60_000 })).toBeNull()
+
+  const rescued = await reserveContinuation("ses_1", 10, 0, { untracked: true, takeOverStartedAfterMs: 0 })
+  expect(rescued?.pendingAttempt).toMatchObject({ started: false, committed: false })
+  // The replacement is unstarted, so a second watchdog cannot take it over.
+  expect(await reserveContinuation("ses_1", 10, 0, { untracked: true, takeOverStartedAfterMs: 0 })).toBeNull()
+})

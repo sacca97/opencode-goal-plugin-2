@@ -1377,13 +1377,23 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
  * (the attempt is a reserved turn); if the attempt is later canceled before it
  * is actually sent, callers must roll it back with rollbackContinuationAttempt.
  */
-export async function reserveContinuation(sessionID: string, maxAutoTurns: number, minIntervalSeconds: number, options?: { untracked?: boolean }) {
+export async function reserveContinuation(
+  sessionID: string,
+  maxAutoTurns: number,
+  minIntervalSeconds: number,
+  options?: { untracked?: boolean; takeOverStartedAfterMs?: number },
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
     // Check before limits too: another server must not send a wrap-up while
     // the first server is still delivering the last allowed turn.
-    if (goal.pendingAttempt) return null
+    // A watchdog may replace an attempt whose turn started but made no progress for
+    // too long; a fresh attempt still blocks, so racing watchdogs reserve one rescue.
+    const pending = goal.pendingAttempt
+    const hung = options?.untracked && options.takeOverStartedAfterMs != null && pending?.started === true &&
+      Date.now() - pending.reservedAt >= options.takeOverStartedAfterMs
+    if (pending && !hung) return null
     if (options?.untracked && goal.status !== "active") return null
     if (goal.status === "budgetLimited" || goal.status === "usageLimited") return reserveWrapup(goal)
     if (!canContinue(goal.status)) return null

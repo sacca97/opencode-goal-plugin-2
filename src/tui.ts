@@ -5,6 +5,7 @@ import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { readFile, stat } from "node:fs/promises"
 import type { GoalMessages } from "./i18n"
 import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
+import { resolveCommandName } from "./command-name"
 import { statePath } from "./state-path"
 
 type GoalCheckpoint = {
@@ -371,7 +372,7 @@ async function showSummaryV2(
   })
   if (typeof selected !== "string" || !options.some((option) => option.value === selected)) return
   try {
-    const name = typeof api.options?.command_name === "string" ? api.options.command_name : "goal"
+    const name = resolveCommandName(api.options?.command_name)
     // The pinned V2 SDK calls this field command; current V2 hosts call it name.
     const input = { sessionID, command: name, name, text: selected === "refresh" ? "status" : selected }
     await api.client.session.command(input)

@@ -35,6 +35,7 @@ import {
   updateGoalPlan,
   validateObjective,
 } from "./state"
+import { resolveCommandName } from "./command-name"
 import type { GoalLocale, GoalMessages } from "./i18n"
 import { formatGoalHistoryPresentation, messagesFor, resolveLocale } from "./i18n"
 import { compactionContext, compactionContextPrefix, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
@@ -81,7 +82,6 @@ type UpdateGoalArgs =
 const DEFAULT_MAX_AUTO_TURNS = 25
 const DEFAULT_CONTINUE_INTERVAL_SECONDS = 3
 const DEFAULT_MAX_PROMPT_FAILURES = 3
-const DEFAULT_COMMAND_NAME = "goal"
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const TASK_SETTLE_DELAY_MS = 25
 const DEFAULT_MAX_TASK_BLOCK_SECONDS = 900
@@ -273,13 +273,6 @@ function omitUndefined<T extends object>(value: T): Partial<T> {
 
 function escapeXmlText(input: string) {
   return input.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-}
-
-function commandNameFromOptions(options?: Options) {
-  const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
-  if (name.toLowerCase() === "pause_goal" || name.toLowerCase() === "resume_goal") return DEFAULT_COMMAND_NAME
-  return name
 }
 
 function positiveIntegerOrNull(value: unknown) {
@@ -1176,7 +1169,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   )
   const maxPromptFailures = positiveIntegerOrNull(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options.register_command ?? true
-  const commandName = commandNameFromOptions(options)
+  const commandName = resolveCommandName(options.command_name)
   const locale = resolveLocale(options.locale)
   const messages = messagesFor(locale)
   const objectiveChars = resolveMaxObjectiveChars(options.max_objective_chars)
@@ -1246,7 +1239,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     try {
       return await context.session.prompt(input)
     } catch (error) {
-      ownedPrompts.delete(key)
+      const remaining = (ownedPrompts.get(key) ?? 1) - 1
+      if (remaining > 0) ownedPrompts.set(key, remaining)
+      else ownedPrompts.delete(key)
       throw error
     }
   }
@@ -1374,7 +1369,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const current = await getGoalInternal(sessionID)
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
       if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || activeContinuationsV2.has(sessionID)) return
-      const reserved = await reserveContinuation(sessionID, maxAutoTurns, 0, { untracked: true })
+      const reserved = await reserveContinuation(sessionID, maxAutoTurns, 0, {
+        untracked: true,
+        takeOverStartedAfterMs: Math.max(maxTurnTimeMs ?? 0, 1_000),
+      })
       if (reserved?.status !== "active" || !reserved.pendingAttempt) return
       claimedGoalID = reserved.id
       claimedAttemptID = reserved.pendingAttempt.id
@@ -2450,6 +2448,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       } catch (error) {
         if (disposed || abortController.signal.aborted) return
         connection.abort()
+        // A long-lived connection that carried no events still proves the stream was healthy.
+        if (Date.now() - connectedAt >= 30_000) failures = 0
         suspendStreamContinuations()
         const cause = (error instanceof Error ? error.message : String(error)).slice(0, 300)
         const retryDelay = EVENT_RETRY_DELAYS_MS[failures]
